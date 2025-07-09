@@ -1,0 +1,10 @@
+.Rproj.user
+.Rhistory
+**/*.RData
+.Ruserdata
+/data
+**/.DS_Store
+.Rapp.history
+.Rproj.user
+**/*.rds
+**/results
