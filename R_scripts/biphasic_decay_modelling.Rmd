@@ -352,15 +352,6 @@ V1_V2_ab %>%
   summarise(p_val = t.test(log(RBD) ~ code)$p.value, .groups = "drop")
 ```
 
-```{r}
-V1_V2_ab %>% group_by(Vaccine, Cohort) %>% summarise(result = leveneTest(Spike ~ code))
-V1_V2_ab %>% group_by(Vaccine, Cohort) %>% summarise(result = leveneTest(RBD ~ code))
-
-V1_V2_ab %>% group_by(code, Cohort) %>% summarise(result = leveneTest(Spike ~ Vaccine))
-V1_V2_ab %>% group_by(code, Cohort) %>% summarise(result = leveneTest(RBD ~ Vaccine))
-```
-
-
 
 Plot posterior population-level parameter estimates for infection only.
 ```{r}
@@ -423,13 +414,6 @@ ggsave(here("results/paper_plots/pop_param_posterior_prior_rec_none.png"), width
 
 ```
 
-Calculate the probability that parameter estimates are greater than others.
-```{r}
-cat("Beta spike > beta RBD:", sum(rec_none_spike$beta_mu > rec_none_rbd$beta_mu, na.rm = TRUE) / (length(rec_none_spike$beta_mu) + length(rec_none_rbd$beta_mu)) * 100)
-
-cat("D_l spike > d_l RBD:", sum(rec_none_spike$dl_mu > rec_none_rbd$dl_mu, na.rm = TRUE) / (length(rec_none_spike$dl_mu) + length(rec_none_rbd$dl_mu)) * 100)
-
-```
 
 Plot posterior SD parameter estimates for infection only.
 ```{r}
@@ -1063,7 +1047,6 @@ multis <- biphasic_model_results$multiplier[,(sum((size_new_tau-1)[1:idx-1])+1):
 
 generated_quantities <- tibble()
 for (i in 1:length(biphasic_model_results$rate)) {
-  # y_reps <- michaels_antibody_model_noise(plot_times, inf_results[[idx]]$no_reinf_tau, c(biphasic_model_results$beta[i,idx], biphasic_model_results$beta[i,idx] * multis[i,1], biphasic_model_results$beta[i,idx] * multis[i,2], biphasic_model_results$beta[i,idx] * multis[i,3]), biphasic_model_results$rho[i,idx], biphasic_model_results$d_a[i,idx], biphasic_model_results$d_l[i,idx], biphasic_model_results$d_s[i,idx], 1, biphasic_model_results$rate[i])
   y_reps <- michaels_antibody_model_noise(plot_times, 0, biphasic_model_results$beta[i,idx], biphasic_model_results$rho[i,idx], biphasic_model_results$d_a[i,idx], biphasic_model_results$d_l[i,idx], biphasic_model_results$d_s[i,idx], 1, biphasic_model_results$rate[i])
   generated_quantities <- rbind(generated_quantities, tibble(plot_times, y_reps))
   print(i)
@@ -1105,49 +1088,6 @@ covid_naive_nomRNA %>% group_by(Record.ID) %>% filter(IgClass %in% c("IgG", NA),
 covid_recovered_nomRNA %>% group_by(Record.ID) %>% filter(IgClass %in% c("IgG", NA), Event.Name %in% c("V2", "B1")) %>% summarise(diff = diff(days)) %>% ungroup() %>% summarise(median(diff))
 ```
 
-
-```{r}
-library(xtable)
-
-posterior_median <- lapply(rstan::extract(IgG_spike_naive_nomRNA, pars = c("beta_mu", "rho_mu", "da_mu", "ds_mu", "dl_mu", "multiplier_mu", "rate")), median)
-
-posterior_cis <- posterior_interval(matrix(unlist(rstan::extract(IgG_spike_naive_nomRNA, pars = c("beta_mu", "rho_mu", "da_mu", "ds_mu", "dl_mu", "multiplier_mu", "rate"))), ncol = length(rstan::extract(IgG_spike_naive_nomRNA, pars = c("beta_mu", "rho_mu", "da_mu", "ds_mu", "dl_mu", "multiplier_mu", "rate")))), prob = 0.95)
-
-x <- rbind(round(unlist(posterior_median), digits = 3), apply(posterior_cis, 1, function(x) paste("[", paste(round(x, digits=3), collapse = ", "), "]", sep="")))
-
-xtable(x)
-```
-
-
-
-```{r}
-library(xtable)
-
-posterior_median <- lapply(single_RBD_rec_none[c("lambda_mu", "rate")], median)
-
-posterior_cis <- bayestestR::ci(as.data.frame(single_RBD_rec_none[c("lambda_mu", "rate")]), ci = 0.95)[, 3:4]
-
-x <- rbind(round(unlist(posterior_median), digits = 3), apply(posterior_cis, 1, function(x) paste("[", paste(round(x, digits=3), collapse = ", "), "]", sep="")))
-
-xtable(x)
-
-
-```
-
-
-
-
-```{r}
-diff_beta <- rstan::extract(IgG_spike_rec_none_all)$beta_mu - single_spike_rec_none$lambda_mu
-
-describe_posterior(diff_beta)
-mean(diff_beta)                          # Mean difference
-quantile(diff_beta, c(0.025, 0.975))     # 95% Credible Interval
-mean(diff_beta > 0) * 100
-
-
-mean(rstan::extract(IgG_spike_rec_none_all)$dl_mu > single_spike_rec_none$lambda_mu) * 100
-```
 
 
 
