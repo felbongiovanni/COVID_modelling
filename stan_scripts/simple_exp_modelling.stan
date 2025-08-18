@@ -70,7 +70,7 @@ generated quantities {
       vector[size_segments[pos]] time_seg = segment(times, sum(size_segments[:pos-1])+1, size_segments[pos]);
       vector[size_segments[pos]] ab_seg = segment(ab, sum(size_segments[:pos-1])+1, size_segments[pos]);
 
-      vector[size_segments[pos]] ab_decay = ab_seg[1]*exp(-/lambda[i]*time_seg);
+      vector[size_segments[pos]] ab_decay = ab_seg[1]*exp(-lambda[i]*time_seg);
 
       for (k in 1:size_segments[pos]) {
         y_rep[y_pos] = gamma_rng(gamma_alpha(ab_decay[k], rate), rate);
