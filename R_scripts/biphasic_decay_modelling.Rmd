@@ -1166,57 +1166,6 @@ ggsave(here("results/paper_plots_revised/llpc_m_num_exp_plots.png"), width = 18,
 
 
 
-Model comparison with Bayes Factor.
-```{r}
-loo_1 <- loo(IgG_Spike_naive_mRNA, save_psis = TRUE, moment_match = TRUE, cores = detectCores()/2)
-loo_2 <- loo(two_beta_fit, save_psis = TRUE, moment_match = TRUE, cores = detectCores()/2)
-# loo_1 <- loo(one_beta_fit)
-# loo_2 <- loo(two_beta_fit)
-loo_1 <- loo_moment_match(fit, loo(fit))
-
-loo_compare(loo_1, loo_2)
-
-ppc_loo_pit_overlay(stan_data$y, rstan::extract(one_beta_fit)$y_rep, loo_1$psis_object$log_weights)
-
-
-which(pareto_k_values(loo_1) > 0.7)
-which(pareto_k_values(loo_2) > 0.7)
-all_y[which(pareto_k_values > 0.7)]
-
-
-sp_stan_obj <- stan(
-      file = here("stan_scripts/COVID_monophasic_model.stan"),
-      data = sp_IgG_Spike_recovered_mRNA_data,
-      chains = 0 # Set chains to 0 to not sample
-    )
-
-bp_stan_obj <- stan(
-      file = here("stan_scripts/COVID_biphasic_model.stan"),
-      data = IgG_Spike_recovered_mRNA_data,
-      chains = 0 # Set chains to 0 to not sample
-    )
-
-# Calculate marginal likelihoods
-bridge1 <- bridge_sampler(samples = IgG_Spike_recovered_mRNA, stanfit_model = bp_stan_obj)
-bridge2 <- bridge_sampler(samples = sp_IgG_Spike_recovered_mRNA, stanfit_model = sp_stan_obj)
-bayes_factor(bridge1, bridge2)
-
-```
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 
