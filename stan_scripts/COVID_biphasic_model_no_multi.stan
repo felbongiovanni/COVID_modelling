@@ -2,10 +2,6 @@ functions {
   real michaels_model(real r_a, real r_s, real r_l, real A_0, real beta, real rho, real time, real tau){
     return (time >= tau) * beta * (rho * ((exp(-r_s*(time-tau))-exp(-r_a*(time-tau))) / (r_a-r_s)) + (1-rho) * ((exp(-r_l*(time-tau))-exp(-r_a*(time-tau))) / (r_a-r_l)));
   }
-  
-  real michaels_model_mod(real r_a, real r_s, real r_l, real A_0, real beta, real multi, real rho, real time, real tau){
-    return (time >= tau) * (beta * multi) * (rho * ((exp(-r_s*(time-tau))-exp(-r_a*(time-tau))) / (r_a-r_s)) + (1-rho) * ((exp(-r_l*(time-tau))-exp(-r_a*(time-tau))) / (r_a-r_l)));
-  }
 
   vector vgamma_alpha(vector mean_ab, real beta) {
     return mean_ab*beta;
@@ -25,15 +21,13 @@ data {
   int<lower=0> Ny; // number of total data points
   int<lower=0> Nt; // number of total time points
   int<lower=0> K; // number of individuals
-  int<lower=0> J; // length of beta and tau vectors
   vector<lower=0>[Ny] y; // antibody data
   vector<lower=0>[Nt] time; // time points
   int size_bt[K]; // number of exposures for each individual
   int size_y[K]; // number of antibody points for each individual 
   int size_T[K]; // number of time points for each individual
-  vector<lower=0>[J] taus; // all exposure times
+  vector<lower=0>[K] taus; // all exposure times
   real A_0;
-  int size_multi[K];
   int Nyt;
   vector[Nyt] yrep_times;
 }
@@ -61,10 +55,6 @@ parameters {
   real<lower=0> ds_mu;
 
   real<lower=0> rate;
-
-  real<lower=0> multiplier_mu;
-  vector<lower=0>[J-K] multiplier;
-  real<lower=0> multi_sd;
 }
 
 
@@ -86,10 +76,8 @@ model {
   d_a ~ lognormal(lognormal_mean(da_mu, da_sd), da_sd);
   d_s ~ lognormal(lognormal_mean(ds_mu, ds_sd), ds_sd);
   beta ~ lognormal(lognormal_mean(beta_mu, beta_sd), beta_sd);
-  multiplier ~ lognormal(multiplier_mu, multi_sd);
 
   // hyperpriors
-  multiplier_mu ~ lognormal(lognormal_mean(5, 0.5), 0.5);
   rho_mu ~ beta(5, 2);
   dl_mu ~ lognormal(lognormal_mean(400, 0.2), 0.2);
   da_mu ~ lognormal(lognormal_mean(21, 0.1), 0.1);
@@ -101,21 +89,15 @@ model {
   da_sd ~ lognormal(0, 1);
   ds_sd ~ lognormal(0, 1);
   beta_sd ~ lognormal(0, 1);
-  multi_sd ~ lognormal(0, 1);
   
   rate ~ lognormal(0, 1);
   
   for (i in 1:K) { // for each individual 
     vector[size_T[i]] time_seg = segment(time, sum(size_T[:i-1])+1, size_T[i]);  
-    vector[size_bt[i]] tau_seg = segment(taus, sum(size_bt[:i-1])+1, size_bt[i]);
-    vector[size_multi[i]] multi_seg = segment(multiplier, sum(size_multi[:i-1])+1, size_multi[i]);
     vector[size_T[i]] ab = A_0*exp(-r_l[i]*time_seg);
   
     for (j in 1:num_elements(time_seg)) { // loop through each time point
-      ab[j] += michaels_model_mod(r_a[i], r_s[i], r_l[i], A_0, beta[i], 1, rho[i], time_seg[j], tau_seg[1]);
-      for (k in 2:num_elements(tau_seg)) { // loop through each boost
-        ab[j] += michaels_model_mod(r_a[i], r_s[i], r_l[i], A_0, beta[i], multi_seg[k-1], rho[i], time_seg[j], tau_seg[k]);
-      }
+      ab[j] += michaels_model(r_a[i], r_s[i], r_l[i], A_0, beta[i], rho[i], time_seg[j], taus[i]);
     }
     segment(y, sum(size_T[:i-1])+1, size_T[i]) ~ gamma(vgamma_alpha(ab, rate), rate);
   }
@@ -128,15 +110,11 @@ generated quantities {
   vector[Nyt*K] y_rep_model;
 
   for (i in 1:K) {
-    vector[size_bt[i]] tau_seg = segment(taus, sum(size_bt[:i-1])+1, size_bt[i]);
-    vector[size_multi[i]] multi_seg = segment(multiplier, sum(size_multi[:i-1])+1, size_multi[i]);
     vector[Nyt] ab = A_0*exp(-r_l[i]*yrep_times);
 
     for (j in 1:Nyt) { // loop through each time point
-      ab[j] += michaels_model_mod(r_a[i], r_s[i], r_l[i], A_0, beta[i], 1, rho[i], yrep_times[j], tau_seg[1]);
-      for (k in 2:num_elements(tau_seg)) { // loop through each boost
-        ab[j] += michaels_model_mod(r_a[i], r_s[i], r_l[i], A_0, beta[i], multi_seg[k-1], rho[i], yrep_times[j], tau_seg[k]);
-      }
+      ab[j] += michaels_model(r_a[i], r_s[i], r_l[i], A_0, beta[i], rho[i], yrep_times[j], taus[i]);
+
       y_rep_model[pos] = ab[j];
       y_rep[pos] = gamma_rng(gamma_alpha(ab[j], rate), rate);
       pos += 1;

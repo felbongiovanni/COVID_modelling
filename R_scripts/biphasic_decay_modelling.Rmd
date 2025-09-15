@@ -6,35 +6,30 @@ output: html_document
 ```{r, include=FALSE}
 library(rstan)
 options(mc.cores = parallel::detectCores())
-rstan_options(auto_write = TRUE)
+rstan_options(auto_write = TRUE, threads_per_chain = 1)
 library(ggplot2)
-library(tidybayes)
-library(ggpubr)
 library(here)
 library(dplyr)
 library(readxl)
-library(rstanarm)
 library(reshape2)
 library(lubridate)
 library(stringr)
 library(tidyr)
 library(pbmcapply)
-library(tidyverse)
-library(bayesplot)
-library(BayesTools)
-library(caret)
-library(xgboost)
-library(loo)
-library(brms)
 library(ggh4x)
-library(truncnorm)
-library(HDInterval)
 library(bayestestR)
 library(matrixStats)
+library(rstantools)
+library(ggpubr)
+library(purrr)
+library(xtable)
+library(patchwork)
+library(bridgesampling)
 ```
 
 
-```{r}
+Import all relevant data.
+```{r, warning=FALSE}
 source(here("R_scripts/functions.R"))
 
 IgG_data <- read_excel(here("data/CP_AdjMFI_IgG_Dec2023_FINAL.xlsx")) %>% mutate(code = str_extract(SampleID, "[^-]+$"), IgClass = "IgG")
@@ -88,6 +83,7 @@ all_data <- all_data %>% group_by(Record.ID) %>% mutate(days = as.numeric(Date.o
 ```
 
 
+Filter data and remove individuals with less than two data points, any vaccination before enrollment, or no baseline sample.
 ```{r}
 all_data <- all_data %>%
   group_by(Record.ID) %>%
@@ -101,6 +97,7 @@ all_data <- all_data %>% left_join(vaccine_info, by = "Record.ID")
 ```
 
 
+Separate individuals according to "naive" and "recovered" status.
 ```{r}
 covid_naive <- all_data %>% filter(Record.ID %in% clinical_data$Record.ID[clinical_data$Please.indicate.appropriate.classification.based.on.answers....Baseline.Visit..A.. == "Non-COVID-19 healthy participant"]) %>% mutate(type = "naive")
 remove_ids <- covid_naive %>% group_by(Record.ID) %>% filter(all(is.na(Dose.1)) && !any(Event.Name == "Reinfection")) %>% ungroup()
@@ -113,97 +110,76 @@ recovered_ids <- unique(covid_recovered$Record.ID)
 ```
 
 
+Further separate according to which vaccine they received for their primary two doses.
 ```{r}
 covid_naive_vaccines <- group_split(covid_naive %>% group_by(Which.vaccine...Baseline.Visit..A..))
 covid_recovered_vaccines <- group_split(covid_recovered %>% group_by(Which.vaccine...Baseline.Visit..A..))
 ```
 
 
+Run stan models for each comparison group.
 ```{r}
-prep_stan_data <- function(individual, dat, protein, ig) {
-  df <- dat %>% filter(Record.ID == individual, IgClass %in% c(ig, NA)) %>% select(all_of(protein), Date.of.blood.sample.collection, When.did.you.receive.your.diagnosis.., Dose.1, Dose.2, Dose.3.., Dose.4, Dose.5, days, type)
-  df <- df %>% arrange(Date.of.blood.sample.collection)
-  
-  tau <- as.numeric(as.Date(c(df$Dose.1, df$Dose.2, df$Dose.3.., df$Dose.4, df$Dose.5, df$When.did.you.receive.your.diagnosis..)) - min(df$Date.of.blood.sample.collection, na.rm = T))
-  tau <- sort(tau[!is.na(tau) & tau >= 0])
+control_params <- list(adapt_delta = 0.999, max_treedepth = 12)
 
-  dd <- as.numeric(as.Date(df$When.did.you.receive.your.diagnosis..) - min(df$Date.of.blood.sample.collection, na.rm = T))
-  dd <- abs(dd[!is.na(dd) & dd < 0])
-  
-  nat_inf <- as.numeric(as.Date(c(df$When.did.you.receive.your.diagnosis..)) - min(df$Date.of.blood.sample.collection, na.rm = T))
-  nat_inf <- sort(nat_inf[!is.na(nat_inf) & nat_inf > 0]) 
+naive_mRNA <- rbind(covid_naive_vaccines[[2]], covid_naive_vaccines[[4]])
+recovered_mRNA <- covid_recovered_vaccines[[4]]
+recovered_nomRNA <- rbind(covid_recovered_vaccines[[2]], covid_recovered_vaccines[[3]])
+naive_nomRNA <- rbind(covid_naive_vaccines[[1]], covid_naive_vaccines[[3]])
 
-  df <- df %>% drop_na(protein) %>% filter(!is.na(Date.of.blood.sample.collection))
+rec_threshold <- rbind(recovered_mRNA, recovered_nomRNA) %>% 
+                 filter(IgClass %in% c("IgG", NA)) %>% 
+                 filter(Event.Name %in% c("R1", "R2", "RR1", "RR2")) %>%
+                 summarise(threshold = mean(NP)) %>%
+                 pull(threshold)
 
-  if (unique(df$type) == "recovered") {
-    nat_inf <- c(0, nat_inf + dd)
-    time <- df$days + dd
-    tau <- c(0, tau + dd)
-    prior_inf_data <- which(time < tau[2])
-    if (length(tau) < 2) {
-      prior_inf_data <- 1:length(time)
-    }
-    if (length(nat_inf) > 1) {
-      non_reinf_data <- which(time < nth(nat_inf,2))
-      new_tau <- tau[tau < nth(nat_inf,2)]
+naive_threshold <- rbind(naive_mRNA, naive_nomRNA) %>% 
+                   filter(IgClass %in% c("IgG", NA)) %>% 
+                   filter(Event.Name %in% c("R1", "R2", "RR1", "RR2")) %>%
+                   summarise(threshold = mean(NP)) %>%
+                   pull(threshold)
+
+comparison_groups <- c("naive_mRNA", "recovered_mRNA", "recovered_nomRNA", "naive_nomRNA", "covid_recovered")
+antigens <- c("Spike", "RBD")
+
+for (group in comparison_groups) {
+  for (protein in antigens) {
+    inf_results <- pbmclapply(unique(get(group)$Record.ID), prep_stan_data_bp_model, get(group), protein, "IgG", mc.cores = detectCores()/2)
+    
+    if (group == "covid_recovered") {
+      prior_inf_data <- unlist(lapply(inf_results, `[[`, 7))
+      prior_inf_t <- unlist(lapply(inf_results[which(prior_inf_data > 1)], `[[`, 8))
+      prior_inf_y <- unlist(lapply(inf_results[which(prior_inf_data > 1)], `[[`, 9))
+      prior_inf_size <- unlist(lapply(inf_results[which(prior_inf_data > 1)], `[[`, 10))
+      
+      stan_data <- list(Ny = length(prior_inf_y),
+                  Nt = length(prior_inf_t),
+                  K = length(prior_inf_size),
+                  y = prior_inf_y,
+                  time = prior_inf_t,
+                  size_bt = rep(1, length(prior_inf_size)),
+                  size_y = prior_inf_size,
+                  size_T = prior_inf_size,
+                  taus = rep(0, length(prior_inf_size)),
+                  A_0 = 1,
+                  yrep_times = seq(0, max(prior_inf_t)+50, by=10),
+                  Nyt = length(seq(0, max(prior_inf_t)+50, by=10)),
+                  ids = unlist(lapply(inf_results[which(prior_inf_data > 1)], `[[`, 1)))
+      
+      stan_fit <- stan(file = here("stan_scripts/COVID_biphasic_model_no_multi.stan"), data = stan_data, iter =  20000, warmup = 5000, chains = 4, control = control_params)
+      
     } else {
-      non_reinf_data <- 1:length(time)
-      new_tau <- tau
-    }
-  } else {
-    nat_inf <- nat_inf
-    time <- df$days 
-    tau <- tau
-    prior_inf_data <- 0
-    if (length(nat_inf) > 0) {
-      non_reinf_data <- which(time < min(nat_inf, na.rm = T))
-      new_tau <- tau[tau < min(nat_inf, na.rm = T)]
-    } else {
-      non_reinf_data <- 1:length(time)
-      new_tau <- tau
-    }
-  }
-  
-  prior_inf_date <- df$When.did.you.receive.your.diagnosis..
-  new_time <- time[non_reinf_data]
-  antibodies <- df[[protein]]
-  new_ab <- antibodies[non_reinf_data]
+      size_data <- unlist(lapply(inf_results, `[[`, 6))
+      size_tau <- unlist(lapply(inf_results, `[[`, 5))
+      no_reinf_y <- unlist(lapply(inf_results[which(size_data > 1 & size_tau > 1)], `[[`, 2))
+      no_reinf_t <- unlist(lapply(inf_results[which(size_data > 1 & size_tau > 1)], `[[`, 3))
+      no_reinf_tau <- unlist(lapply(inf_results[which(size_data > 1 & size_tau > 1)], `[[`, 4))
+      size_no_reinf_data <- unlist(lapply(inf_results[which(size_data > 1 & size_tau > 1)], `[[`, 6))
+      size_new_tau <- unlist(lapply(inf_results[which(size_data > 1 & size_tau > 1)], `[[`, 5))
 
-  return(list(ID = individual, no_reinf_y = new_ab, no_reinf_t = new_time, no_reinf_tau = new_tau, size_tau = length(new_tau), size_no_reinf = length(non_reinf_data), prior_inf_data = length(prior_inf_data), prior_inf_time = time[prior_inf_data], prior_inf_ab = antibodies[prior_inf_data], size_prior_inf = length(prior_inf_data), inf_date = prior_inf_date))
-}
-
-covid_naive_mRNA <- rbind(covid_naive_vaccines[[2]], covid_naive_vaccines[[4]])
-# covid_recovered_none <- covid_recovered_vaccines[[1]]
-covid_recovered_mRNA <- covid_recovered_vaccines[[4]]
-covid_recovered_nomRNA <- rbind(covid_recovered_vaccines[[2]], covid_recovered_vaccines[[3]])
-covid_naive_nomRNA <- rbind(covid_naive_vaccines[[1]], covid_naive_vaccines[[3]])
-
-inf_ids <- unique(covid_recovered$Record.ID)
-inf_df <- covid_recovered
-
-inf_results <- pbmclapply(inf_ids, prep_stan_data, inf_df, "RBD", "IgG", mc.cores = detectCores()/2)
-```
-
-
-```{r}
-# prior_inf_data <- unlist(lapply(inf_results, `[[`, 7))
-# prior_inf_t <- unlist(lapply(inf_results[which(prior_inf_data > 1)], `[[`, 8))
-# prior_inf_y <- unlist(lapply(inf_results[which(prior_inf_data > 1)], `[[`, 9))
-# prior_inf_size <- unlist(lapply(inf_results[which(prior_inf_data > 1)], `[[`, 10))
-
-
-no_reinf_y <- unlist(lapply(inf_results, `[[`, 2))
-no_reinf_t <- unlist(lapply(inf_results, `[[`, 3))
-no_reinf_tau <- unlist(lapply(inf_results, `[[`, 4))
-size_new_tau <- unlist(lapply(inf_results, `[[`, 5))
-size_no_reinf_data <- unlist(lapply(inf_results, `[[`, 6))
-```
-
-
-```{r}
-stan_data <- list(Ny = length(no_reinf_y),
+      
+      stan_data <- list(Ny = length(no_reinf_y),
                   Nt = length(no_reinf_t),
-                  K = length(inf_ids),
+                  K = length(size_no_reinf_data),
                   J = length(no_reinf_tau),
                   y = no_reinf_y,
                   time = no_reinf_t,
@@ -212,53 +188,21 @@ stan_data <- list(Ny = length(no_reinf_y),
                   size_T = size_no_reinf_data,
                   taus = no_reinf_tau,
                   A_0 = 1,
-                  size_multi = size_new_tau-1)
-
-# stan_data <- list(Ny = length(prior_inf_y),
-#                   Nt = length(prior_inf_t),
-#                   K = length(prior_inf_size),
-#                   J = length(prior_inf_size),
-#                   y = prior_inf_y,
-#                   time = prior_inf_t,
-#                   size_bt = rep(1, length(prior_inf_size)),
-#                   size_y = prior_inf_size,
-#                   size_T = prior_inf_size,
-#                   taus = rep(0, length(prior_inf_size)),
-#                   A_0 = 1)
-
-```
-
-Prior predictive modelling.
-```{r}
-id_taus <- tibble(tau = no_reinf_tau, ID = rep(inf_ids, size_new_tau))
-ab_data <- tibble(y = stan_data$y, time = stan_data$time, ID = rep(inf_ids, size_no_reinf_data)) 
-
-ppc_beta <- rlnorm(500, meanlog = lognormal_mean(1500, 0.3), sdlog = 0.3)
-ppc_rho <- rbeta(500, 5, 2)
-ppc_da <- rlnorm(500, meanlog = lognormal_mean(21, 0.1), sdlog = 0.1)
-ppc_dl <- rlnorm(500, meanlog = lognormal_mean(400, 0.2), sdlog = 0.2)
-ppc_ds <- rlnorm(500, meanlog = lognormal_mean(3.5, 0.15), sdlog = 0.15)
-
-prior_pred <- tibble()
-
-for (id in inf_ids) {
-  id_times <- ab_data %>% filter(ID == id) %>% pull(time)
-  id_abs <- ab_data %>% filter(ID == id) %>% pull(y)
-  prior_pred <- rbind(prior_pred, sapply(id_times, michaels_antibody_model_pp, (id_taus %>% filter(ID == id) %>% pull(tau)), ppc_beta, ppc_rho, ppc_da, ppc_dl, ppc_ds, 1) %>% melt() %>% mutate(days = map_dbl(Var2, function(x) id_times[x]), ID = id, obs_ab = map_dbl(Var2, function(x) id_abs[x])))
+                  size_multi = size_new_tau-1,
+                  yrep_times = seq(0, max(no_reinf_t)+50, by=10),
+                  Nyt = length(seq(0, max(no_reinf_t)+50, by=10)),
+                  ids = unlist(lapply(inf_results[which(size_data > 1 & size_tau > 1)], `[[`, 1)))
+      
+      stan_fit <- stan(file = here("stan_scripts/COVID_biphasic_model.stan"), data = stan_data, iter =  20000, warmup = 5000, chains = 4, control = control_params)
+    }
+    assign(paste0("IgG_", protein, "_", group), stan_fit)
+    save(list=paste0("IgG_", protein, "_", group), file = here(paste0("results/model_fits/IgG_", protein, "_", group, ".Rdata")))
+    assign(paste0("IgG_", protein, "_", group, "_data"), stan_data)
+    save(list=paste0("IgG_", protein, "_", group, "_data"), file = here(paste0("results/model_fits/IgG_", protein, "_", group, "_data.Rdata")))
+  }
 }
 
-
-prior_pred %>% ggplot() + geom_point(aes(x = days, y = obs_ab)) + geom_line(aes(x = days, y = value, group = as.factor(Var1)), colour = "red", alpha = 0.01) + facet_wrap(ID ~., scales = "free")
 ```
-
-
-
-```{r}
-control_params <- list(adapt_delta = 0.999, max_treedepth = 12)
-stan_fit <- stan(file = here("stan_scripts/COVID_biphasic_model.stan"), data = stan_data, iter =  20000, warmup = 5000, chains = 4, control = control_params)
-
-```
-
 
 Check model diagnostics.
 ```{r}
@@ -270,71 +214,125 @@ mcmc_pairs(stan_fit, pars = c("beta_sd","rho_sd", "da_sd", "dl_sd", "ds_sd", "mu
 ```
 
 
+# Results
+
+Calculate the significance of demographic data across key comparison groups.
 ```{r}
-round(summary(stan_fit)$summary[c("beta_mu", "rho_mu", "da_mu", "ds_mu", "dl_mu", "multiplier_mu", "beta_sd", "rho_sd", "da_sd", "ds_sd", "dl_sd", "multi_sd", "rate"), ], 3)
+demos <- rbind(covid_naive %>% 
+               filter(Record.ID %in% IgG_Spike_naive_mRNA_data$ids) %>% 
+               distinct(Record.ID, Age..Baseline.Visit..A.., Which.vaccine...Baseline.Visit..A.., Gender.at.birth..Baseline.Visit..A..) %>%
+               mutate(group = "Naive mRNA"),
+             covid_naive %>% 
+               filter(Record.ID %in% IgG_Spike_naive_nomRNA_data$ids) %>% 
+               distinct(Record.ID, Age..Baseline.Visit..A.., Which.vaccine...Baseline.Visit..A.., Gender.at.birth..Baseline.Visit..A..) %>%
+               mutate(group = "Naive non-mRNA"),
+             covid_recovered %>% 
+               filter(Record.ID %in% IgG_Spike_recovered_mRNA_data$ids) %>% 
+               distinct(Record.ID, Age..Baseline.Visit..A.., Which.vaccine...Baseline.Visit..A.., Gender.at.birth..Baseline.Visit..A..) %>%
+               mutate(group = "Recovered mRNA"),
+             covid_recovered %>% 
+               filter(Record.ID %in% IgG_Spike_recovered_nomRNA_data$ids) %>% 
+               distinct(Record.ID, Age..Baseline.Visit..A.., Which.vaccine...Baseline.Visit..A.., Gender.at.birth..Baseline.Visit..A..) %>%
+               mutate(group = "Recovered non-mRNA"))
+
+demos %>% group_by(group, Which.vaccine...Baseline.Visit..A..) %>% summarise(sample_size = n())
+demos %>% group_by(group, Gender.at.birth..Baseline.Visit..A..) %>% summarise(sample_size = n())
+demos %>% group_by(group) %>% summarise(age_median = median(Age..Baseline.Visit..A..), age_lower = min(Age..Baseline.Visit..A..), age_upper = max(Age..Baseline.Visit..A..))
+
+anova <- aov(Age..Baseline.Visit..A.. ~ as.factor(group), data = demos)
+summary(anova)
+TukeyHSD(anova)
 ```
 
 
-# Results
-
 Calculate geometric mean of antibody levels 2-4 weeks after first vaccination (V1), second vaccination (V2), and booster (B1).
 ```{r}
-V1_V2_ab <- rbind(covid_naive_mRNA %>% 
-        group_by(Record.ID) %>% filter(days < first(as.numeric(as.Date(c(When.did.you.receive.your.diagnosis..)) - min(Date.of.blood.sample.collection, na.rm = T)), na_rm = TRUE)) %>%
-        filter(IgClass %in% c("IgG", NA), Event.Name %in% c("V1", "V2", "B1")) %>% 
-        select(Spike, RBD, code) %>% 
+V1_V2_ab <- rbind(naive_mRNA %>% 
+  group_by(Record.ID) %>% 
+  filter(IgClass %in% c("IgG", NA)) %>% 
+  filter(as.Date(Date.of.blood.sample.collection) < min(as.Date(When.did.you.receive.your.diagnosis..), as.Date("2025-01-01"), na.rm = T)) %>%
+  filter(!(NP > lag(NP) & (Spike > lag(Spike) & RBD > lag(RBD)) & NP >= naive_threshold)) %>%
+  filter(Event.Name %in% c("V1", "V2", "B1")) %>%
+  select(Spike, RBD, code) %>% 
         mutate(Cohort = "Naive", Vaccine = "mRNA"),
-      covid_naive_nomRNA %>% 
-        group_by(Record.ID) %>% filter(days < first(as.numeric(as.Date(c(When.did.you.receive.your.diagnosis..)) - min(Date.of.blood.sample.collection, na.rm = T)), na_rm = TRUE)) %>%
-        filter(IgClass %in% c("IgG", NA), Event.Name %in% c("V1", "V2", "B1")) %>% 
-        select(Spike, RBD, code) %>% 
+      naive_nomRNA %>% 
+  group_by(Record.ID) %>% 
+  filter(IgClass %in% c("IgG", NA) & Record.ID != "LVCC-0096") %>% 
+  filter(as.Date(Date.of.blood.sample.collection) < min(as.Date(When.did.you.receive.your.diagnosis..), as.Date("2025-01-01"), na.rm = T)) %>%
+  filter(!(NP > lag(NP) & (Spike > lag(Spike) & RBD > lag(RBD)) & NP >= naive_threshold)) %>%
+  filter(Event.Name %in% c("V1", "V2", "B1")) %>%
+  select(Spike, RBD, code) %>% 
         mutate(Cohort = "Naive", Vaccine = "non-mRNA"),
-      covid_recovered_mRNA %>% 
-        group_by(Record.ID) %>% filter(days < nth(c(as.numeric(as.Date(c(When.did.you.receive.your.diagnosis..)) - min(Date.of.blood.sample.collection, na.rm = T)), Inf), 2, na_rm = TRUE)) %>%
-        filter(IgClass %in% c("IgG", NA), Event.Name %in% c("V1", "V2", "B1")) %>% 
-        select(Spike, RBD, code) %>% 
+      recovered_mRNA %>% 
+  group_by(Record.ID) %>% 
+  filter(IgClass %in% c("IgG", NA) & Record.ID != "LVCC-0088") %>% 
+  filter(as.Date(Date.of.blood.sample.collection) < nth(c(as.Date(When.did.you.receive.your.diagnosis..), as.Date("2025-01-01")), 2, na_rm = T)) %>%
+  filter(!(NP > lag(NP) & (Spike > lag(Spike) & RBD > lag(RBD)) & NP >= rec_threshold)) %>%
+  filter(Event.Name %in% c("V1", "V2", "B1")) %>%
+  select(Spike, RBD, code) %>% 
         mutate(Cohort = "Recovered", Vaccine = "mRNA"),
-      covid_recovered_nomRNA %>% 
-        group_by(Record.ID) %>% filter(days < nth(c(as.numeric(as.Date(c(When.did.you.receive.your.diagnosis..)) - min(Date.of.blood.sample.collection, na.rm = T)), Inf), 2, na_rm = TRUE)) %>%
-        filter(IgClass %in% c("IgG", NA), Event.Name %in% c("V1", "V2", "B1")) %>% 
-        select(Spike, RBD, code) %>% 
+      recovered_nomRNA %>% 
+  group_by(Record.ID) %>% 
+  filter(IgClass %in% c("IgG", NA)) %>% 
+  filter(as.Date(Date.of.blood.sample.collection) < nth(c(as.Date(When.did.you.receive.your.diagnosis..), as.Date("2025-01-01")), 2, na_rm = T)) %>%
+  filter(!(NP > lag(NP) & (Spike > lag(Spike) & RBD > lag(RBD)) & NP >= rec_threshold)) %>%
+  filter(Event.Name %in% c("V1", "V2", "B1")) %>%
+  select(Spike, RBD, code) %>% 
         mutate(Cohort = "Recovered", Vaccine = "non-mRNA"))
 
 melted_ab_info <- V1_V2_ab %>% melt()
 
 vacc_geom_means <- melted_ab_info %>% group_by(code, Cohort, Vaccine, variable) %>% reframe(geom_mean = exp(mean(log(value))))
 
-ggplot() + geom_violin(data = melted_ab_info, aes(x = Cohort, y = value, fill = Vaccine), alpha = 0.6) + geom_point(data = vacc_geom_means, aes(x = Cohort, y = geom_mean, fill = Vaccine), position = position_dodge(width = .9), shape = 18, size = 4) + facet_grid(variable ~ factor(code, levels = c("V1", "V2", "B1")), labeller = as_labeller(c("B1" = "Booster vaccination", "V1" = "First vaccination", "V2" = "Second vaccination", "Spike" = "Spike", "RBD" = "RBD"))) + theme(axis.text=element_text(size=16), axis.title=element_text(size=16), strip.text = element_text(size = 16), legend.text=element_text(size=16), legend.title=element_text(size=16), plot.title = element_text(size=18), panel.grid.major = element_blank(), panel.grid.minor = element_blank()) + ylab("Adjusted MFI") 
+ggplot() + 
+  geom_violin(data = melted_ab_info, aes(x = Cohort, y = value, fill = Vaccine), alpha = 0.6) + 
+  geom_point(data = vacc_geom_means, aes(x = Cohort, y = geom_mean, fill = Vaccine), position = position_dodge(width = .9), shape = 18, size = 6) + 
+  geom_point(data = melted_ab_info, aes(x = Cohort, y = value, fill = Vaccine), position = position_dodge(width = .9), alpha = 0.2) +
+  facet_grid(variable ~ factor(code, levels = c("V1", "V2", "B1")), labeller = as_labeller(c("B1" = "Booster vaccination", "V1" = "First vaccination", "V2" = "Second vaccination", "Spike" = "Spike", "RBD" = "RBD"))) + 
+  theme_bw() +
+  theme(axis.text=element_text(size=22), axis.title=element_text(size=22), strip.text = element_text(size = 22), legend.text=element_text(size=22), legend.title=element_text(size=22), plot.title = element_text(size=24), panel.grid.major = element_blank(), panel.grid.minor = element_blank()) +
+  ylab("Adjusted MFI") 
 
-ggsave(here("COVID/results/paper_plots/geom_mean_IgG.png"), width = 12, dpi = 300)
+ggsave(here("results/paper_plots_revised/geom_mean_IgG.png"), width = 14, dpi = 300)
+ggsave(here("results/paper_plots_revised/geom_mean_IgG.pdf"), width = 14, dpi = 300)
 
 ```
+
 
 Calculate p-values for different groups.
 ```{r}
 # Test across cohort
 V1_V2_ab %>%
   group_by(code, Vaccine) %>%
-  summarise(p_val = t.test(log(Spike) ~ Cohort)$p.value, .groups = "drop")
+  summarise(p_val = t.test(log(Spike) ~ Cohort)$p.value, .groups = "drop") %>% 
+  mutate(p_val = format(p_val, scientific = TRUE)) %>%
+  pivot_wider(names_from = code, values_from = p_val) %>% 
+  relocate(Vaccine, V1, V2, B1)
 
 V1_V2_ab %>%
   group_by(code, Vaccine) %>%
-  summarise(p_val = t.test(log(RBD) ~ Cohort)$p.value, .groups = "drop")
+  summarise(p_val = t.test(log(RBD) ~ Cohort)$p.value, .groups = "drop") %>% 
+  pivot_wider(names_from = code, values_from = p_val) %>% 
+  relocate(Vaccine, V1, V2, B1)
 
 # Test across vaccine type
 V1_V2_ab %>%
   group_by(code, Cohort) %>%
-  summarise(p_val = t.test(log(Spike) ~ Vaccine)$p.value, .groups = "drop")
+  summarise(p_val = t.test(log(Spike) ~ Vaccine)$p.value, .groups = "drop") %>% 
+  pivot_wider(names_from = code, values_from = p_val) %>% 
+  relocate(Cohort, V1, V2, B1)
 
 V1_V2_ab %>%
   group_by(code, Cohort) %>%
-  summarise(p_val = t.test(log(RBD) ~ Vaccine)$p.value, .groups = "drop")
+  summarise(p_val = t.test(log(RBD) ~ Vaccine)$p.value, .groups = "drop") %>% 
+  pivot_wider(names_from = code, values_from = p_val) %>% 
+  relocate(Cohort, V1, V2, B1)
 
 # Test across vaccine schedule
 V1_V2_ab %>%
   filter(code %in% c("V1", "V2")) %>%
   group_by(Vaccine, Cohort) %>%
-  summarise(p_val = t.test(log(Spike) ~ code)$p.value, .groups = "drop")
+  summarise(p_val = t.test(log(Spike) ~ code)$p.value, .groups = "drop") 
 
 V1_V2_ab %>%
   filter(code %in% c("V2", "B1")) %>%
@@ -353,29 +351,52 @@ V1_V2_ab %>%
 ```
 
 
-Plot posterior population-level parameter estimates for infection only.
+Extract all model results (note: these may need to be loaded back into the R environment)
 ```{r}
-rec_none_spike <- rstan::extract(IgG_spike_rec_none_all)
-rec_none_rbd <- rstan::extract(IgG_RBD_rec_none_all)
+bp_naive_mRNA_spike <- rstan::extract(IgG_Spike_naive_mRNA) %>% purrr::list_modify("y_rep_model" = NULL)
+bp_naive_mRNA_rbd <- rstan::extract(IgG_RBD_naive_mRNA) %>% purrr::list_modify("y_rep_model" = NULL)
+bp_naive_nomRNA_spike <- rstan::extract(IgG_Spike_naive_nomRNA) %>% purrr::list_modify("y_rep_model" = NULL)
+bp_naive_nomRNA_rbd <- rstan::extract(IgG_RBD_naive_nomRNA) %>% purrr::list_modify("y_rep_model" = NULL)
+bp_rec_mRNA_spike <- rstan::extract(IgG_Spike_recovered_mRNA) %>% purrr::list_modify("y_rep_model" = NULL)
+bp_rec_mRNA_rbd <- rstan::extract(IgG_RBD_recovered_mRNA) %>% purrr::list_modify("y_rep_model" = NULL)
+bp_rec_nomRNA_spike <- rstan::extract(IgG_Spike_recovered_nomRNA) %>% purrr::list_modify("y_rep_model" = NULL)
+bp_rec_nomRNA_rbd <- rstan::extract(IgG_RBD_recovered_nomRNA) %>% purrr::list_modify("y_rep_model" = NULL)
+bp_rec_none_spike <- rstan::extract(IgG_Spike_covid_recovered)[c("beta_mu", "dl_mu", "y_rep")]
+bp_rec_none_rbd <- rstan::extract(IgG_RBD_covid_recovered)[c("beta_mu", "dl_mu", "y_rep")]
 
-priors <- tibble(beta = rlnorm(length(rec_none_spike$beta_mu), lognormal_mean(1500, 0.3), 0.3),
-                 rho = rbeta(length(rec_none_spike$rho_mu), 5, 2),
-                 d_l = rlnorm(length(rec_none_spike$dl_mu), lognormal_mean(400, 0.2), 0.2),
-                 d_a = rlnorm(length(rec_none_spike$da_mu), lognormal_mean(21, 0.1), 0.1),
-                 d_s = rlnorm(length(rec_none_spike$ds_mu), lognormal_mean(3.5, 0.15), 0.15))
+sp_naive_mRNA_spike <- rstan::extract(sp_IgG_Spike_naive_mRNA)
+sp_naive_mRNA_rbd <- rstan::extract(sp_IgG_RBD_naive_mRNA)
+sp_naive_nomRNA_spike <- rstan::extract(sp_IgG_Spike_naive_nomRNA)
+sp_naive_nomRNA_rbd <- rstan::extract(sp_IgG_RBD_naive_nomRNA)
+sp_rec_mRNA_spike <- rstan::extract(sp_IgG_Spike_recovered_mRNA)
+sp_rec_mRNA_rbd <- rstan::extract(sp_IgG_RBD_recovered_mRNA)
+sp_rec_nomRNA_spike <- rstan::extract(sp_IgG_Spike_recovered_nomRNA)
+sp_rec_nomRNA_rbd <- rstan::extract(sp_IgG_RBD_recovered_nomRNA)
+sp_rec_none_spike <- rstan::extract(sp_IgG_Spike_covid_recovered)
+sp_rec_none_rbd <- rstan::extract(sp_IgG_RBD_covid_recovered)
+```
+
+
+Plot BP model posterior population-level parameter estimates for infection only.
+```{r}
+priors <- tibble(beta = rlnorm(length(bp_rec_none_spike$beta_mu), lognormal_mean(1500, 0.3), 0.3),
+                 rho = rbeta(length(bp_rec_none_spike$rho_mu), 5, 2),
+                 d_l = rlnorm(length(bp_rec_none_spike$dl_mu), lognormal_mean(400, 0.2), 0.2),
+                 d_a = rlnorm(length(bp_rec_none_spike$da_mu), lognormal_mean(21, 0.1), 0.1),
+                 d_s = rlnorm(length(bp_rec_none_spike$ds_mu), lognormal_mean(3.5, 0.15), 0.15))
 
 priors_melted <- priors %>% melt() %>% mutate(antigen = "Prior")
 
-posteriors <- rbind(tibble(beta = rec_none_spike$beta_mu,
-       rho = rec_none_spike$rho_mu,
-       d_l = rec_none_spike$dl_mu,
-       d_a = rec_none_spike$da_mu,
-       d_s = rec_none_spike$ds_mu) %>% mutate(antigen = "Spike"),
-      tibble(beta = rec_none_rbd$beta_mu,
-       rho = rec_none_rbd$rho_mu,
-       d_l = rec_none_rbd$dl_mu,
-       d_a = rec_none_rbd$da_mu,
-       d_s = rec_none_rbd$ds_mu) %>% mutate(antigen = "RBD")) 
+posteriors <- rbind(tibble(beta = bp_rec_none_spike$beta_mu,
+       rho = bp_rec_none_spike$rho_mu,
+       d_l = bp_rec_none_spike$dl_mu,
+       d_a = bp_rec_none_spike$da_mu,
+       d_s = bp_rec_none_spike$ds_mu) %>% mutate(antigen = "Spike"),
+      tibble(beta = bp_rec_none_rbd$beta_mu,
+       rho = bp_rec_none_rbd$rho_mu,
+       d_l = bp_rec_none_rbd$dl_mu,
+       d_a = bp_rec_none_rbd$da_mu,
+       d_s = bp_rec_none_rbd$ds_mu) %>% mutate(antigen = "RBD")) 
 
 posteriors_melted <- posteriors %>% melt()
 
@@ -398,8 +419,10 @@ rec_none_plot <- rbind(posteriors_melted, priors_melted)
 rec_none_plot %>% 
 ggplot(aes(value)) + 
   geom_density(aes(fill = antigen, alpha = antigen, size = antigen)) + scale_alpha_manual(values = c(Prior = 0, RBD = 0.4, Spike = 0.4)) + scale_size_manual(values = c(Prior = 0.8, RBD = 0.5, Spike = 0.5)) +
-  facet_nested(~ variable, scales="free", independent = "all", labeller = label_parsed) + theme(
-    strip.text.x = element_text(size = 18, margin = margin(t = 20, b = 5))) + labs(fill = "Antigen response", alpha = "Antigen response", size = "Antigen response") + theme(axis.text=element_text(size=16), axis.title=element_text(size=16), strip.text = element_text(size = 16), legend.text=element_text(size=16), legend.title=element_text(size=16), plot.title = element_text(size=18)) + 
+  facet_nested(~ variable, scales="free", independent = "all", labeller = label_parsed, ncol = 3) + 
+  labs(fill = "Antigen response", alpha = "Antigen response", size = "Antigen response") + 
+  theme_bw() + 
+  theme(axis.text=element_text(size=22), axis.title=element_text(size=22), strip.text = element_text(size = 22), strip.text.x = element_text(size = 22, margin = margin(t = 20, b = 5)), legend.text=element_text(size=22), legend.title=element_text(size=22), plot.title = element_text(size=24), panel.grid.major = element_blank(), panel.grid.minor = element_blank()) +
   facetted_pos_scales(x = list(
                       variable == expression("Increase in antibodies \nper day post exposure ("*mu[beta]*")") ~ scale_x_continuous(limits = c(min(priors$beta, na.rm = T), max(priors$beta, na.rm = T))),
                       variable == expression("Proportion of short-\nlived plasma cells ("*mu[rho]*")") ~ scale_x_continuous(limits = c(min(priors$rho, na.rm = T), max(priors$rho, na.rm = T))),
@@ -408,158 +431,89 @@ ggplot(aes(value)) +
                       variable == expression("Half-life of short-\nlived plasma cells ("*mu[d[s]]*")") ~ scale_x_continuous(limits = c(min(priors$d_s, na.rm = T), max(priors$d_s, na.rm = T)))
   )) + xlab("Parameter value") + ylab("Probability density")
 
-ggsave(here("results/paper_plots/pop_param_posterior_prior_rec_none.png"), width = 20, height = 10, dpi = 300)
-
-
+ggsave(here("results/paper_plots_revised/pop_param_posterior_prior_rec_none.png"), width = 14, dpi = 300)
 
 ```
 
 
-Plot posterior SD parameter estimates for infection only.
+
+Plot BP model posterior population-level parameter estimates for vaccine recipients.
 ```{r}
-priors <- tibble(beta = rlnorm(length(rec_none_spike$beta_mu), 0, 1),
-                 rho = rlnorm(length(rec_none_spike$rho_mu), 0, 1),
-                 d_l = rlnorm(length(rec_none_spike$dl_mu), 0, 1),
-                 d_a = rlnorm(length(rec_none_spike$da_mu), 0, 1),
-                 d_s = rlnorm(length(rec_none_spike$ds_mu), 0, 1))
-
-priors_melted <- priors %>% melt() %>% mutate(antigen = "Prior")
-
-posteriors <- rbind(tibble(beta = rec_none_spike$beta_sd,
-       rho = rec_none_spike$rho_sd,
-       d_l = rec_none_spike$dl_sd,
-       d_a = rec_none_spike$da_sd,
-       d_s = rec_none_spike$ds_sd) %>% mutate(antigen = "Spike"),
-      tibble(beta = rec_none_rbd$beta_sd,
-       rho = rec_none_rbd$rho_sd,
-       d_l = rec_none_rbd$dl_sd,
-       d_a = rec_none_rbd$da_sd,
-       d_s = rec_none_rbd$ds_sd) %>% mutate(antigen = "RBD")) 
-
-posteriors_melted <- posteriors %>% melt()
-
-posteriors_melted$variable <- factor(posteriors_melted$variable, 
-                        labels = c(beta = expression("Standard deviation from" ~mu[beta]~ "("*sigma[beta]*")"),
-                        rho = expression("Standard deviation from" ~mu[rho]~ "("*sigma[rho]*")"),
-                        d_l = expression("Standard deviation from" ~mu[d[l]]~ "("*sigma[d[l]]*")"),
-                        d_a = expression("Standard deviation from" ~mu[d[a]]~ "("*sigma[d[a]]*")"),
-                        d_s = expression("Standard deviation from" ~mu[d[s]]~ "("*sigma[d[s]]*")")))
-
-priors_melted$variable <- factor(priors_melted$variable,
-                        labels = c(beta = expression("Standard deviation from" ~mu[beta]~ "("*sigma[beta]*")"),
-                        rho = expression("Standard deviation from" ~mu[rho]~ "("*sigma[rho]*")"),
-                        d_l = expression("Standard deviation from" ~mu[d[l]]~ "("*sigma[d[l]]*")"),
-                        d_a = expression("Standard deviation from" ~mu[d[a]]~ "("*sigma[d[a]]*")"),
-                        d_s = expression("Standard deviation from" ~mu[d[s]]~ "("*sigma[d[s]]*")")))
-
-rec_none_plot <- rbind(posteriors_melted, priors_melted)
-
-rec_none_plot %>% 
-ggplot(aes(value)) + 
-  geom_density(aes(fill = antigen, alpha = antigen, size = antigen)) + scale_alpha_manual(values = c(Prior = 0, RBD = 0.4, Spike = 0.4)) + scale_size_manual(values = c(Prior = 0.8, RBD = 0.5, Spike = 0.5)) +
-  facet_nested(~ variable, scales="free", independent = "all", labeller = label_parsed) + theme(
-    strip.text.x = element_text(size = 16)) + labs(fill = "Antigen response", alpha = "Antigen response", size = "Antigen response") + theme(axis.text=element_text(size=16), axis.title=element_text(size=16), strip.text = element_text(size = 16), legend.text=element_text(size=16), legend.title=element_text(size=16), plot.title = element_text(size=18)) + 
-  facetted_pos_scales(x = list(
-                      variable == expression("Standard deviation from" ~mu[beta]~ "("*sigma[beta]*")") ~ scale_x_continuous(limits = c(min(priors$beta, na.rm = T), 2)),
-                      variable == expression("Standard deviation from" ~mu[rho]~ "("*sigma[rho]*")") ~ scale_x_continuous(limits = c(min(priors$rho, na.rm = T), 2)),
-                      variable == expression("Standard deviation from" ~mu[d[l]]~ "("*sigma[d[l]]*")") ~ scale_x_continuous(limits = c(min(priors$d_l, na.rm = T), 2)),
-                      variable == expression("Standard deviation from" ~mu[d[a]]~ "("*sigma[d[a]]*")") ~ scale_x_continuous(limits = c(min(priors$d_a, na.rm = T), 2)),
-                      variable == expression("Standard deviation from" ~mu[d[s]]~ "("*sigma[d[s]]*")") ~ scale_x_continuous(limits = c(min(priors$d_s, na.rm = T), 2))
-  )) + xlab("Parameter value") + ylab("Probability density")
-
-ggsave(here("results/paper_plots/pop_sd_posterior_prior_rec_none.png"), width = 20, height = 10, dpi = 300)
-
-
-
-```
-
-
-Plot posterior population-level parameter estimates for vaccines.
-```{r}
-RBD_naive_mRNA <- rstan::extract(IgG_RBD_naive_mRNA)
-RBD_naive_nomRNA <- rstan::extract(IgG_RBD_naive_nomRNA)
-RBD_rec_mRNA <- rstan::extract(IgG_RBD_rec_mRNA)
-RBD_rec_nomRNA <- rstan::extract(IgG_RBD_rec_nomRNA)
-spike_naive_mRNA <- rstan::extract(IgG_spike_naive_mRNA)
-spike_naive_nomRNA <- rstan::extract(IgG_spike_naive_nomRNA)
-spike_rec_mRNA <- rstan::extract(IgG_spike_rec_mRNA)
-spike_rec_nomRNA <- rstan::extract(IgG_spike_rec_nomRNA)
-
-inf_plot_data <- rbind(tibble(beta = RBD_naive_mRNA$beta_mu,
-       rho = RBD_naive_mRNA$rho_mu,
-       d_l = RBD_naive_mRNA$dl_mu,
-       d_a = RBD_naive_mRNA$da_mu,
-       d_s = RBD_naive_mRNA$ds_mu,
-       m = RBD_naive_mRNA$multiplier_mu) %>% mutate(vaccine = "mRNA", cohort = "Naive", antigen = "RBD"),
-      tibble(beta = RBD_naive_nomRNA$beta_mu,
-       rho = RBD_naive_nomRNA$rho_mu,
-       d_l = RBD_naive_nomRNA$dl_mu,
-       d_a = RBD_naive_nomRNA$da_mu,
-       d_s = RBD_naive_nomRNA$ds_mu,
-       m = RBD_naive_nomRNA$multiplier_mu) %>% mutate(vaccine = "non-mRNA", cohort = "Naive", antigen = "RBD"),
-      tibble(beta = RBD_rec_mRNA$beta_mu,     
-       rho = RBD_rec_mRNA$rho_mu,
-       d_l = RBD_rec_mRNA$dl_mu,
-       d_a = RBD_rec_mRNA$da_mu,
-       d_s = RBD_rec_mRNA$ds_mu,
-       m = RBD_rec_mRNA$multiplier_mu) %>% mutate(vaccine = "mRNA", cohort = "Recovered", antigen = "RBD"),
-      tibble(beta = RBD_rec_nomRNA$beta_mu,
-       rho = RBD_rec_nomRNA$rho_mu,
-       d_l = RBD_rec_nomRNA$dl_mu,
-       d_a = RBD_rec_nomRNA$da_mu,
-       d_s = RBD_rec_nomRNA$ds_mu,
-       m = RBD_rec_nomRNA$multiplier_mu) %>% mutate(vaccine = "non-mRNA", cohort = "Recovered", antigen = "RBD"),
-      tibble(beta = spike_naive_mRNA$beta_mu,
-       rho = spike_naive_mRNA$rho_mu,
-       d_l = spike_naive_mRNA$dl_mu,
-       d_a = spike_naive_mRNA$da_mu,
-       d_s = spike_naive_mRNA$ds_mu,
-       m = spike_naive_mRNA$multiplier_mu) %>% mutate(vaccine = "mRNA", cohort = "Naive", antigen = "Spike"),
-      tibble(beta = spike_naive_nomRNA$beta_mu,
-       rho = spike_naive_nomRNA$rho_mu,
-       d_l = spike_naive_nomRNA$dl_mu,
-       d_a = spike_naive_nomRNA$da_mu,
-       d_s = spike_naive_nomRNA$ds_mu,
-       m = spike_naive_nomRNA$multiplier_mu) %>% mutate(vaccine = "non-mRNA", cohort = "Naive", antigen = "Spike"),
-      tibble(beta = spike_rec_mRNA$beta_mu,     
-       rho = spike_rec_mRNA$rho_mu,
-       d_l = spike_rec_mRNA$dl_mu,
-       d_a = spike_rec_mRNA$da_mu,
-       d_s = spike_rec_mRNA$ds_mu,
-       m = spike_rec_mRNA$multiplier_mu) %>% mutate(vaccine = "mRNA", cohort = "Recovered", antigen = "Spike"),
-      tibble(beta = spike_rec_nomRNA$beta_mu,
-       rho = spike_rec_nomRNA$rho_mu,
-       d_l = spike_rec_nomRNA$dl_mu,
-       d_a = spike_rec_nomRNA$da_mu,
-       d_s = spike_rec_nomRNA$ds_mu,
-       m = spike_rec_nomRNA$multiplier_mu) %>% mutate(vaccine = "non-mRNA", cohort = "Recovered", antigen = "Spike"))
+inf_plot_data <- rbind(tibble(beta = bp_naive_mRNA_rbd$beta_mu,
+       rho = bp_naive_mRNA_rbd$rho_mu,
+       d_l = bp_naive_mRNA_rbd$dl_mu,
+       d_a = bp_naive_mRNA_rbd$da_mu,
+       d_s = bp_naive_mRNA_rbd$ds_mu,
+       m = bp_naive_mRNA_rbd$multiplier_mu) %>% mutate(vaccine = "mRNA", cohort = "Naive", antigen = "RBD"),
+      tibble(beta = bp_naive_nomRNA_rbd$beta_mu,
+       rho = bp_naive_nomRNA_rbd$rho_mu,
+       d_l = bp_naive_nomRNA_rbd$dl_mu,
+       d_a = bp_naive_nomRNA_rbd$da_mu,
+       d_s = bp_naive_nomRNA_rbd$ds_mu,
+       m = bp_naive_nomRNA_rbd$multiplier_mu) %>% mutate(vaccine = "non-mRNA", cohort = "Naive", antigen = "RBD"),
+      tibble(beta = bp_rec_mRNA_rbd$beta_mu,     
+       rho = bp_rec_mRNA_rbd$rho_mu,
+       d_l = bp_rec_mRNA_rbd$dl_mu,
+       d_a = bp_rec_mRNA_rbd$da_mu,
+       d_s = bp_rec_mRNA_rbd$ds_mu,
+       m = bp_rec_mRNA_rbd$multiplier_mu) %>% mutate(vaccine = "mRNA", cohort = "Recovered", antigen = "RBD"),
+      tibble(beta = bp_rec_nomRNA_rbd$beta_mu,
+       rho = bp_rec_nomRNA_rbd$rho_mu,
+       d_l = bp_rec_nomRNA_rbd$dl_mu,
+       d_a = bp_rec_nomRNA_rbd$da_mu,
+       d_s = bp_rec_nomRNA_rbd$ds_mu,
+       m = bp_rec_nomRNA_rbd$multiplier_mu) %>% mutate(vaccine = "non-mRNA", cohort = "Recovered", antigen = "RBD"),
+      tibble(beta = bp_naive_mRNA_spike$beta_mu,
+       rho = bp_naive_mRNA_spike$rho_mu,
+       d_l = bp_naive_mRNA_spike$dl_mu,
+       d_a = bp_naive_mRNA_spike$da_mu,
+       d_s = bp_naive_mRNA_spike$ds_mu,
+       m = bp_naive_mRNA_spike$multiplier_mu) %>% mutate(vaccine = "mRNA", cohort = "Naive", antigen = "Spike"),
+      tibble(beta = bp_naive_nomRNA_spike$beta_mu,
+       rho = bp_naive_nomRNA_spike$rho_mu,
+       d_l = bp_naive_nomRNA_spike$dl_mu,
+       d_a = bp_naive_nomRNA_spike$da_mu,
+       d_s = bp_naive_nomRNA_spike$ds_mu,
+       m = bp_naive_nomRNA_spike$multiplier_mu) %>% mutate(vaccine = "non-mRNA", cohort = "Naive", antigen = "Spike"),
+      tibble(beta = bp_rec_mRNA_spike$beta_mu,     
+       rho = bp_rec_mRNA_spike$rho_mu,
+       d_l = bp_rec_mRNA_spike$dl_mu,
+       d_a = bp_rec_mRNA_spike$da_mu,
+       d_s = bp_rec_mRNA_spike$ds_mu,
+       m = bp_rec_mRNA_spike$multiplier_mu) %>% mutate(vaccine = "mRNA", cohort = "Recovered", antigen = "Spike"),
+      tibble(beta = bp_rec_nomRNA_spike$beta_mu,
+       rho = bp_rec_nomRNA_spike$rho_mu,
+       d_l = bp_rec_nomRNA_spike$dl_mu,
+       d_a = bp_rec_nomRNA_spike$da_mu,
+       d_s = bp_rec_nomRNA_spike$ds_mu,
+       m = bp_rec_nomRNA_spike$multiplier_mu) %>% mutate(vaccine = "non-mRNA", cohort = "Recovered", antigen = "Spike"))
 
 melted_inf_data_plot <- melt(inf_plot_data)
 
-priors_melted <- rbind(tibble(beta = rlnorm(length(RBD_naive_nomRNA$beta_mu), lognormal_mean(1500, 0.3), 0.3),
-                 rho = rbeta(length(RBD_naive_nomRNA$rho_mu), 5, 2),
-                 d_l = rlnorm(length(RBD_naive_nomRNA$dl_mu), lognormal_mean(400, 0.2), 0.2),
-                 d_a = rlnorm(length(RBD_naive_nomRNA$da_mu), lognormal_mean(21, 0.1), 0.1),
-                 d_s = rlnorm(length(RBD_naive_nomRNA$ds_mu), lognormal_mean(3.5, 0.15), 0.15),
-                 m = rlnorm(length(RBD_naive_nomRNA$multiplier_mu), lognormal_mean(5, 0.5), 0.5)) %>% mutate(vaccine = "mRNA", cohort = "Recovered", antigen = "Prior"),
-                 tibble(beta = rlnorm(length(RBD_naive_nomRNA$beta_mu), lognormal_mean(1500, 0.3), 0.3),
-                 rho = rbeta(length(RBD_naive_nomRNA$rho_mu), 5, 2),
-                 d_l = rlnorm(length(RBD_naive_nomRNA$dl_mu), lognormal_mean(400, 0.2), 0.2),
-                 d_a = rlnorm(length(RBD_naive_nomRNA$da_mu), lognormal_mean(21, 0.1), 0.1),
-                 d_s = rlnorm(length(RBD_naive_nomRNA$ds_mu), lognormal_mean(3.5, 0.15), 0.15),
-                 m = rlnorm(length(RBD_naive_nomRNA$multiplier_mu), lognormal_mean(5, 0.5), 0.5)) %>% mutate(vaccine = "mRNA", cohort = "Naive", antigen = "Prior"),
-                 tibble(beta = rlnorm(length(RBD_naive_nomRNA$beta_mu), lognormal_mean(1500, 0.3), 0.3),
-                 rho = rbeta(length(RBD_naive_nomRNA$rho_mu), 5, 2),
-                 d_l = rlnorm(length(RBD_naive_nomRNA$dl_mu), lognormal_mean(400, 0.2), 0.2),
-                 d_a = rlnorm(length(RBD_naive_nomRNA$da_mu), lognormal_mean(21, 0.1), 0.1),
-                 d_s = rlnorm(length(RBD_naive_nomRNA$ds_mu), lognormal_mean(3.5, 0.15), 0.15),
-                 m = rlnorm(length(RBD_naive_nomRNA$multiplier_mu), lognormal_mean(5, 0.5), 0.5)) %>% mutate(vaccine = "non-mRNA", cohort = "Recovered", antigen = "Prior"),
-                 tibble(beta = rlnorm(length(RBD_naive_nomRNA$beta_mu), lognormal_mean(1500, 0.3), 0.3),
-                 rho = rbeta(length(RBD_naive_nomRNA$rho_mu), 5, 2),
-                 d_l = rlnorm(length(RBD_naive_nomRNA$dl_mu), lognormal_mean(400, 0.2), 0.2),
-                 d_a = rlnorm(length(RBD_naive_nomRNA$da_mu), lognormal_mean(21, 0.1), 0.1),
-                 d_s = rlnorm(length(RBD_naive_nomRNA$ds_mu), lognormal_mean(3.5, 0.15), 0.15),
-                 m = rlnorm(length(RBD_naive_nomRNA$multiplier_mu), lognormal_mean(5, 0.5), 0.5)) %>% mutate(vaccine = "non-mRNA", cohort = "Naive", antigen = "Prior")) %>% melt()
+priors_melted <- rbind(tibble(beta = rlnorm(length(bp_rec_mRNA_spike$beta_mu), lognormal_mean(1500, 0.3), 0.3),
+                 rho = rbeta(length(bp_rec_mRNA_spike$rho_mu), 5, 2),
+                 d_l = rlnorm(length(bp_rec_mRNA_spike$dl_mu), lognormal_mean(400, 0.2), 0.2),
+                 d_a = rlnorm(length(bp_rec_mRNA_spike$da_mu), lognormal_mean(21, 0.1), 0.1),
+                 d_s = rlnorm(length(bp_rec_mRNA_spike$ds_mu), lognormal_mean(3.5, 0.15), 0.15),
+                 m = rlnorm(length(bp_rec_mRNA_spike$multiplier_mu), lognormal_mean(5, 0.5), 0.5)) %>% mutate(vaccine = "mRNA", cohort = "Recovered", antigen = "Prior"),
+                 tibble(beta = rlnorm(length(bp_naive_mRNA_spike$beta_mu), lognormal_mean(1500, 0.3), 0.3),
+                 rho = rbeta(length(bp_naive_mRNA_spike$rho_mu), 5, 2),
+                 d_l = rlnorm(length(bp_naive_mRNA_spike$dl_mu), lognormal_mean(400, 0.2), 0.2),
+                 d_a = rlnorm(length(bp_naive_mRNA_spike$da_mu), lognormal_mean(21, 0.1), 0.1),
+                 d_s = rlnorm(length(bp_naive_mRNA_spike$ds_mu), lognormal_mean(3.5, 0.15), 0.15),
+                 m = rlnorm(length(bp_naive_mRNA_spike$multiplier_mu), lognormal_mean(5, 0.5), 0.5)) %>% mutate(vaccine = "mRNA", cohort = "Naive", antigen = "Prior"),
+                 tibble(beta = rlnorm(length(bp_rec_nomRNA_spike$beta_mu), lognormal_mean(1500, 0.3), 0.3),
+                 rho = rbeta(length(bp_rec_nomRNA_spike$rho_mu), 5, 2),
+                 d_l = rlnorm(length(bp_rec_nomRNA_spike$dl_mu), lognormal_mean(400, 0.2), 0.2),
+                 d_a = rlnorm(length(bp_rec_nomRNA_spike$da_mu), lognormal_mean(21, 0.1), 0.1),
+                 d_s = rlnorm(length(bp_rec_nomRNA_spike$ds_mu), lognormal_mean(3.5, 0.15), 0.15),
+                 m = rlnorm(length(bp_rec_nomRNA_spike$multiplier_mu), lognormal_mean(5, 0.5), 0.5)) %>% mutate(vaccine = "non-mRNA", cohort = "Recovered", antigen = "Prior"),
+                 tibble(beta = rlnorm(length(bp_naive_nomRNA_spike$beta_mu), lognormal_mean(1500, 0.3), 0.3),
+                 rho = rbeta(length(bp_naive_nomRNA_spike$rho_mu), 5, 2),
+                 d_l = rlnorm(length(bp_naive_nomRNA_spike$dl_mu), lognormal_mean(400, 0.2), 0.2),
+                 d_a = rlnorm(length(bp_naive_nomRNA_spike$da_mu), lognormal_mean(21, 0.1), 0.1),
+                 d_s = rlnorm(length(bp_naive_nomRNA_spike$ds_mu), lognormal_mean(3.5, 0.15), 0.15),
+                 m = rlnorm(length(bp_naive_nomRNA_spike$multiplier_mu), lognormal_mean(5, 0.5), 0.5)) %>% mutate(vaccine = "non-mRNA", cohort = "Naive", antigen = "Prior")) %>% melt()
 
 melted_inf_data_plot$variable <- factor(melted_inf_data_plot$variable, 
                         labels = c(beta = expression("Increase in anti-\nbodies per day \npost exposure ("*mu[beta]*")"),
@@ -567,7 +521,7 @@ melted_inf_data_plot$variable <- factor(melted_inf_data_plot$variable,
                         d_l = expression("Half-life of \nlong-lived \nplasma cells ("*mu[d[l]]*")"),
                         d_a = expression("Half-life of \nIgG antibodies ("*mu[d[a]]*")"),
                         d_s = expression("Half-life of \nshort-lived \nplasma cells ("*mu[d[s]]*")"),
-                        m = expression("Multiple of" ~beta~ "("*italic(m)*")")))
+                        m = expression("Fold change in\nantibody increase\nacross exposures ("*mu[m]*")")))
 
 priors_melted$variable <- factor(priors_melted$variable, 
                         labels = c(beta = expression("Increase in anti-\nbodies per day \npost exposure ("*mu[beta]*")"),
@@ -575,7 +529,7 @@ priors_melted$variable <- factor(priors_melted$variable,
                         d_l = expression("Half-life of \nlong-lived \nplasma cells ("*mu[d[l]]*")"),
                         d_a = expression("Half-life of \nIgG antibodies ("*mu[d[a]]*")"),
                         d_s = expression("Half-life of \nshort-lived \nplasma cells ("*mu[d[s]]*")"),
-                        m = expression("Multiple of" ~beta~ "("*italic(m)*")")))
+                        m = expression("Fold change in\nantibody increase\nacross exposures ("*mu[m]*")")))
 
 melted_plot_data <- rbind(melted_inf_data_plot, priors_melted)
 
@@ -583,510 +537,678 @@ melted_plot_data %>%
   ggplot(aes(value)) + 
   geom_density(aes(fill = antigen, alpha = antigen, size = antigen)) + scale_alpha_manual(values = c(Prior = 0, RBD = 0.4, Spike = 0.4)) + scale_size_manual(values = c(Prior = 0.8, RBD = 0.5, Spike = 0.5)) +
   facet_nested(vaccine + cohort ~ variable, scales="free", independent = "all", labeller = label_parsed) + theme(
-    strip.text.x = element_text(size = 18, margin = margin(t = 40, b = 5))) + labs(fill = "Antigen response", alpha = "Antigen response", size = "Antigen response") + theme(axis.text=element_text(size=16), axis.title=element_text(size=16), strip.text = element_text(size = 16), legend.text=element_text(size=16), legend.title=element_text(size=16), plot.title = element_text(size=18)) + 
+    strip.text.x = element_text(size = 22, margin = margin(t = 40, b = 5))) + labs(fill = "Antigen response", alpha = "Antigen response", size = "Antigen response") + theme(axis.text=element_text(size=22), axis.title=element_text(size=22), strip.text = element_text(size = 22), legend.text=element_text(size=22), legend.title=element_text(size=22), plot.title = element_text(size=24)) + 
   facetted_pos_scales(x = list(
                       variable == expression("Increase in anti-\nbodies per day \npost exposure ("*mu[beta]*")") ~ scale_x_continuous(limits = c(min(inf_plot_data$beta, na.rm = T), max(inf_plot_data$beta, na.rm = T))),
                       variable == expression("Proportion of \nshort-lived \nplasma cells ("*mu[rho]*")") ~ scale_x_continuous(limits = c(min(inf_plot_data$rho, na.rm = T), max(inf_plot_data$rho, na.rm = T))),
                       variable == expression("Half-life of \nlong-lived \nplasma cells ("*mu[d[l]]*")") ~ scale_x_continuous(limits = c(min(inf_plot_data$d_l, na.rm = T), max(inf_plot_data$d_l, na.rm = T))),
                       variable == expression("Half-life of \nIgG antibodies ("*mu[d[a]]*")") ~ scale_x_continuous(limits = c(min(inf_plot_data$d_a, na.rm = T), max(inf_plot_data$d_a, na.rm = T))),
                       variable == expression("Half-life of \nshort-lived \nplasma cells ("*mu[d[s]]*")") ~ scale_x_continuous(limits = c(min(inf_plot_data$d_s, na.rm = T), max(inf_plot_data$d_s, na.rm = T))),
-                      variable == expression("Multiple of" ~beta~ "("*italic(m)*")") ~ scale_x_continuous(limits = c(min(inf_plot_data$m, na.rm = T), max(inf_plot_data$m, na.rm = T)))
-  )) + xlab("Parameter value") + ylab("Probability density")
+                      variable == expression(m = expression("Fold change in\nantibody increase\nacross exposures ("*mu[m]*")")) ~ scale_x_continuous(limits = c(0, 3)))) + xlab("Parameter value") + ylab("Probability density")
 
-ggsave(here("results/paper_plots/pop_param_estimates_naive_and_rec_spike_rbd_prior_comparison.png"), width = 22, height = 13, dpi = 300)
+ggsave(here("results/paper_plots_revised/pop_param_estimates_naive_and_rec_spike_rbd_prior_comparison.png"), width = 30, height = 15, dpi = 300)
+
+```
+
+
+Get median and credible intervals for posterior estimates of each model fit.
+```{r}
+
+
+# filtered_fit <- bp_naive_nomRNA_rbd[c("beta_mu", "rho_mu", "da_mu", "ds_mu", "dl_mu", "multiplier_mu", "rate")]
+filtered_fit <- sp_naive_mRNA_spike[c("lambda_mu", "rate")]
+posterior_median <- lapply(filtered_fit, median)
+
+posterior_cis <- bayestestR::ci(as.data.frame(filtered_fit, ci = 0.95))[, 3:4]
+
+x <- rbind(round(unlist(posterior_median), digits = 3), apply(posterior_cis, 1, function(x) paste("[", paste(round(x, digits=3), collapse = ", "), "]", sep="")))
+
+xtable(x)
+
 
 ```
 
 
-Plot posterior population-level SDs for vaccines.
+Plot antibody response half-life for BP and SP model.
 ```{r}
-sd_plot_data <- rbind(tibble(beta = RBD_naive_mRNA$beta_sd,
-       rho = RBD_naive_mRNA$rho_sd,
-       d_l = RBD_naive_mRNA$dl_sd,
-       d_a = RBD_naive_mRNA$da_sd,
-       d_s = RBD_naive_mRNA$ds_sd,
-       m = RBD_naive_mRNA$multi_sd) %>% mutate(vaccine = "mRNA", cohort = "Naive", antigen = "RBD"),
-      tibble(beta = RBD_naive_nomRNA$beta_sd,
-       rho = RBD_naive_nomRNA$rho_sd,
-       d_l = RBD_naive_nomRNA$dl_sd,
-       d_a = RBD_naive_nomRNA$da_sd,
-       d_s = RBD_naive_nomRNA$ds_sd,
-       m = RBD_naive_nomRNA$multi_sd) %>% mutate(vaccine = "non-mRNA", cohort = "Naive", antigen = "RBD"),
-      tibble(beta = RBD_rec_mRNA$beta_sd,     
-       rho = RBD_rec_mRNA$rho_sd,
-       d_l = RBD_rec_mRNA$dl_sd,
-       d_a = RBD_rec_mRNA$da_sd,
-       d_s = RBD_rec_mRNA$ds_sd,
-       m = RBD_rec_mRNA$multi_sd) %>% mutate(vaccine = "mRNA", cohort = "Recovered", antigen = "RBD"),
-      tibble(beta = RBD_rec_nomRNA$beta_sd,
-       rho = RBD_rec_nomRNA$rho_sd,
-       d_l = RBD_rec_nomRNA$dl_sd,
-       d_a = RBD_rec_nomRNA$da_sd,
-       d_s = RBD_rec_nomRNA$ds_sd,
-       m = RBD_rec_nomRNA$multi_sd) %>% mutate(vaccine = "non-mRNA", cohort = "Recovered", antigen = "RBD"),
-      tibble(beta = spike_naive_mRNA$beta_sd,
-       rho = spike_naive_mRNA$rho_sd,
-       d_l = spike_naive_mRNA$dl_sd,
-       d_a = spike_naive_mRNA$da_sd,
-       d_s = spike_naive_mRNA$ds_sd,
-       m = spike_naive_mRNA$multi_sd) %>% mutate(vaccine = "mRNA", cohort = "Naive", antigen = "Spike"),
-      tibble(beta = spike_naive_nomRNA$beta_sd,
-       rho = spike_naive_nomRNA$rho_sd,
-       d_l = spike_naive_nomRNA$dl_sd,
-       d_a = spike_naive_nomRNA$da_sd,
-       d_s = spike_naive_nomRNA$ds_sd,
-       m = spike_naive_nomRNA$multi_sd) %>% mutate(vaccine = "non-mRNA", cohort = "Naive", antigen = "Spike"),
-      tibble(beta = spike_rec_mRNA$beta_sd,     
-       rho = spike_rec_mRNA$rho_sd,
-       d_l = spike_rec_mRNA$dl_sd,
-       d_a = spike_rec_mRNA$da_sd,
-       d_s = spike_rec_mRNA$ds_sd,
-       m = spike_rec_mRNA$multi_sd) %>% mutate(vaccine = "mRNA", cohort = "Recovered", antigen = "Spike"),
-      tibble(beta = spike_rec_nomRNA$beta_sd,
-       rho = spike_rec_nomRNA$rho_sd,
-       d_l = spike_rec_nomRNA$dl_sd,
-       d_a = spike_rec_nomRNA$da_sd,
-       d_s = spike_rec_nomRNA$ds_sd,
-       m = spike_rec_nomRNA$multi_sd) %>% mutate(vaccine = "non-mRNA", cohort = "Recovered", antigen = "Spike"))
-
-melted_sd_data_plot <- melt(sd_plot_data)
-
-sd_priors_melted <- rbind(tibble(beta = rlnorm(length(RBD_naive_nomRNA$beta_sd), 0, 1),
-                 rho = rlnorm(length(RBD_naive_nomRNA$rho_sd), 0, 1),
-                 d_l = rlnorm(length(RBD_naive_nomRNA$dl_sd), 0, 1),
-                 d_a = rlnorm(length(RBD_naive_nomRNA$da_sd), 0, 1),
-                 d_s = rlnorm(length(RBD_naive_nomRNA$ds_sd), 0, 1),
-                 m = rlnorm(length(RBD_naive_nomRNA$multi_sd), 0, 1)) %>% mutate(vaccine = "mRNA", cohort = "Recovered", antigen = "Prior"),
-                 tibble(beta = rlnorm(length(RBD_naive_nomRNA$beta_sd), 0, 1),
-                 rho = rlnorm(length(RBD_naive_nomRNA$rho_sd), 0, 1),
-                 d_l = rlnorm(length(RBD_naive_nomRNA$dl_sd), 0, 1),
-                 d_a = rlnorm(length(RBD_naive_nomRNA$da_sd), 0, 1),
-                 d_s = rlnorm(length(RBD_naive_nomRNA$ds_sd), 0, 1),
-                 m = rlnorm(length(RBD_naive_nomRNA$multi_sd), 0, 1)) %>% mutate(vaccine = "mRNA", cohort = "Naive", antigen = "Prior"),
-                 tibble(beta = rlnorm(length(RBD_naive_nomRNA$beta_sd), 0, 1),
-                 rho = rlnorm(length(RBD_naive_nomRNA$rho_sd), 0, 1),
-                 d_l = rlnorm(length(RBD_naive_nomRNA$dl_sd), 0, 1),
-                 d_a = rlnorm(length(RBD_naive_nomRNA$da_sd), 0, 1),
-                 d_s = rlnorm(length(RBD_naive_nomRNA$ds_sd), 0, 1),
-                 m = rlnorm(length(RBD_naive_nomRNA$multi_sd), 0, 1)) %>% mutate(vaccine = "non-mRNA", cohort = "Recovered", antigen = "Prior"),
-                 tibble(beta = rlnorm(length(RBD_naive_nomRNA$beta_sd), 0, 1),
-                 rho = rlnorm(length(RBD_naive_nomRNA$rho_sd), 0, 1),
-                 d_l = rlnorm(length(RBD_naive_nomRNA$dl_sd), 0, 1),
-                 d_a = rlnorm(length(RBD_naive_nomRNA$da_sd), 0, 1),
-                 d_s = rlnorm(length(RBD_naive_nomRNA$ds_sd), 0, 1),
-                 m = rlnorm(length(RBD_naive_nomRNA$multi_sd), 0, 1)) %>% mutate(vaccine = "non-mRNA", cohort = "Naive", antigen = "Prior")) %>% melt()
-
-melted_sd_data_plot$variable <- factor(melted_sd_data_plot$variable, 
-                        labels = c(beta = expression("Standard \ndeviation \nfrom" ~mu[beta]~ "("*sigma[beta]*")"),
-                        rho = expression("Standard \ndeviation \nfrom" ~mu[rho]~ "("*sigma[rho]*")"),
-                        d_l = expression("Standard \ndeviation \nfrom" ~mu[d[l]]~ "("*sigma[d[l]]*")"),
-                        d_a = expression("Standard \ndeviation \nfrom" ~mu[d[a]]~ "("*sigma[d[a]]*")"),
-                        d_s = expression("Standard \ndeviation \nfrom" ~mu[d[s]]~ "("*sigma[d[s]]*")"),
-                        m = expression("Standard \ndeviation \nfrom" ~mu[italic(m)]~ "("*sigma[italic(m)]*")")))
-
-sd_priors_melted$variable <- factor(sd_priors_melted$variable, 
-                        labels = c(beta = expression("Standard \ndeviation \nfrom" ~mu[beta]~ "("*sigma[beta]*")"),
-                        rho = expression("Standard \ndeviation \nfrom" ~mu[rho]~ "("*sigma[rho]*")"),
-                        d_l = expression("Standard \ndeviation \nfrom" ~mu[d[l]]~ "("*sigma[d[l]]*")"),
-                        d_a = expression("Standard \ndeviation \nfrom" ~mu[d[a]]~ "("*sigma[d[a]]*")"),
-                        d_s = expression("Standard \ndeviation \nfrom" ~mu[d[s]]~ "("*sigma[d[s]]*")"),
-                        m = expression("Standard \ndeviation \nfrom" ~mu[italic(m)]~ "("*sigma[italic(m)]*")")))
-
-sd_melted_plot_data <- rbind(melted_sd_data_plot, sd_priors_melted)
-
-sd_melted_plot_data %>% 
-  ggplot(aes(value)) + 
-  geom_density(aes(fill = antigen, alpha = antigen, size = antigen)) + scale_alpha_manual(values = c(Prior = 0, RBD = 0.4, Spike = 0.4)) + scale_size_manual(values = c(Prior = 0.8, RBD = 0.5, Spike = 0.5)) +
-  facet_nested(vaccine + cohort ~ variable, scales="free", independent = "all", labeller = label_parsed) + theme(
-    strip.text.x = element_text(size = 18, margin = margin(t = 40, b = 5))) + labs(fill = "Antigen response", alpha = "Antigen response", size = "Antigen response") + theme(axis.text=element_text(size=16), axis.title=element_text(size=16), strip.text = element_text(size = 16), legend.text=element_text(size=16), legend.title=element_text(size=16), plot.title = element_text(size=18)) + 
-  facetted_pos_scales(x = list(
-                      variable == expression("Standard \ndeviation \nfrom" ~mu[beta]~ "("*sigma[beta]*")") ~ scale_x_continuous(limits = c(min(sd_plot_data$beta, na.rm = T), max(sd_plot_data$beta, na.rm = T))),
-                      variable == expression("Standard \ndeviation \nfrom" ~mu[rho]~ "("*sigma[rho]*")") ~ scale_x_continuous(limits = c(min(sd_plot_data$rho, na.rm = T), 0.5)),
-                      variable == expression("Standard \ndeviation \nfrom" ~mu[d[l]]~ "("*sigma[d[l]]*")") ~ scale_x_continuous(limits = c(min(sd_plot_data$d_l, na.rm = T), max(sd_plot_data$d_l, na.rm = T))),
-                      variable == expression("Standard \ndeviation \nfrom" ~mu[d[a]]~ "("*sigma[d[a]]*")") ~ scale_x_continuous(limits = c(min(sd_plot_data$d_a, na.rm = T), max(sd_plot_data$d_a, na.rm = T))),
-                      variable == expression("Standard \ndeviation \nfrom" ~mu[d[s]]~ "("*sigma[d[s]]*")") ~ scale_x_continuous(limits = c(min(sd_plot_data$d_s, na.rm = T), max(sd_plot_data$d_s, na.rm = T))),
-                      variable == expression("Standard \ndeviation \nfrom" ~mu[italic(m)]~ "("*sigma[italic(m)]*")") ~ scale_x_continuous(limits = c(min(sd_plot_data$m, na.rm = T), max(sd_plot_data$m, na.rm = T)))
-  )) + xlab("Parameter value") + ylab("Probability density")
-
-ggsave(here("results/paper_plots/pop_param_estimates_naive_and_rec_spike_rbd_sd_comparison.png"), width = 22, height = 13, dpi = 300)
-
-```
-
-Plot single exponential decay against bi-phasic decay results.
-```{r}
-single_spike_rec_mRNA <-  rstan::extract(miceadds::load.Rdata2(filename = "IgG_spike_rec_mRNA.Rdata", path=here("results/simple_decay_fits/")))
-single_spike_naive_mRNA <- rstan::extract(miceadds::load.Rdata2(filename = "IgG_spike_naive_mRNA.Rdata", path=here("results/simple_decay_fits/")))
-single_spike_rec_nomRNA <- rstan::extract(miceadds::load.Rdata2(filename = "IgG_spike_rec_nomRNA.Rdata", path=here("results/simple_decay_fits/")))
-single_spike_naive_nomRNA <- rstan::extract(miceadds::load.Rdata2(filename = "IgG_spike_naive_nomRNA.Rdata", path=here("results/simple_decay_fits/")))
-single_spike_rec_none <- rstan::extract(miceadds::load.Rdata2(filename = "IgG_spike_rec_none.Rdata", path=here("results/simple_decay_fits/")))
-
-
-spike_model_decays <- rbind(tibble(d_l = spike_naive_mRNA$dl_mu,
-       d_a = spike_naive_mRNA$da_mu,
-       d_s = spike_naive_mRNA$ds_mu) %>% mutate(Vaccine = "mRNA", Cohort = "Naive", Model = "Bi-phasic decay"),
-      tibble(d_l = spike_naive_nomRNA$dl_mu,
-       d_a = spike_naive_nomRNA$da_mu,
-       d_s = spike_naive_nomRNA$ds_mu) %>% mutate(Vaccine = "non-mRNA", Cohort = "Naive", Model = "Bi-phasic decay"),
-      tibble(d_l = spike_rec_mRNA$dl_mu,
-       d_a = spike_rec_mRNA$da_mu,
-       d_s = spike_rec_mRNA$ds_mu) %>% mutate(Vaccine = "mRNA", Cohort = "Recovered", Model = "Bi-phasic decay"),
-      tibble(d_l = spike_rec_nomRNA$dl_mu,
-       d_a = spike_rec_nomRNA$da_mu,
-       d_s = spike_rec_nomRNA$ds_mu) %>% mutate(Vaccine = "non-mRNA", Cohort = "Recovered", Model = "Bi-phasic decay"),
-      tibble(d_l = rec_none_spike$dl_mu,
-       d_a = rec_none_spike$da_mu,
-       d_s = rec_none_spike$ds_mu) %>% mutate(Vaccine = "None", Cohort = "Recovered", Model = "Bi-phasic decay"),
-      tibble(d_l = single_spike_naive_mRNA$lambda_mu,
-             d_a = NA,
-             d_s = NA) %>% mutate(Vaccine = "mRNA", Cohort = "Naive", Model = "Single decay"),
-      tibble(d_l = single_spike_naive_nomRNA$lambda_mu,
-             d_a = NA,
-             d_s = NA) %>% mutate(Vaccine = "non-mRNA", Cohort = "Naive", Model = "Single decay"),
-      tibble(d_l = single_spike_rec_mRNA$lambda_mu,
-             d_a = NA,
-             d_s = NA) %>% mutate(Vaccine = "mRNA", Cohort = "Recovered", Model = "Single decay"),
-      tibble(d_l = single_spike_rec_nomRNA$lambda_mu,
-             d_a = NA,
-             d_s = NA) %>% mutate(Vaccine = "non-mRNA", Cohort = "Recovered", Model = "Single decay"),
-      tibble(d_l = single_spike_rec_none$lambda_mu,
-             d_a = NA,
-             d_s = NA) %>% mutate(Vaccine = "None", Cohort = "Recovered", Model = "Single decay"))
-
-
-melted_spike_model_decays <- spike_model_decays %>% melt()
-
-melted_spike_model_decays$variable <- factor(melted_spike_model_decays$variable, 
-                        labels = c(d_l = expression("Half-life of the antibody response (" *mu[d[l]]~ "&" ~lambda* ")"),
-                                  d_a = expression("Half-life of IgG ("*mu[d[a]]*")"),
-                                  d_s = expression("Half-life of SLPCs ("*mu[d[s]]*")")))
-
-
-ggplot(data = melted_spike_model_decays %>% group_by(Vaccine, Cohort, Model, variable) %>% reframe(ci_min = unlist(ci(value, ci = 0.95))[2], ci_max = unlist(ci(value, ci = 0.95))[3], median = median(value))) + geom_errorbar(aes(y = Cohort, xmin = ci_min, xmax = ci_max, colour = Model), position = position_dodge(width = .75), width = .45, linewidth = 1) + geom_point(aes(y = Cohort, x = median, colour = Model), position = position_dodge(width = .75), size = 3) + facet_grid(Vaccine ~ variable, scale = "free_x", labeller = label_parsed) + xlab("Half-life (days)") + theme(axis.text=element_text(size=16), axis.title=element_text(size=16), strip.text = element_text(size = 16), legend.text=element_text(size=16), plot.title = element_text(size=18), legend.title=element_text(size=18)) 
-
-
-ggsave(here("results/paper_plots/model_decay_rates_spike.png"), width = 18, height = 15, dpi = 300)
-```
-
-
-```{r}
-single_RBD_rec_mRNA <- rstan::extract(miceadds::load.Rdata2(filename = "IgG_RBD_rec_mRNA.Rdata", path=here("results/simple_decay_fits/")))
-single_RBD_naive_mRNA <- rstan::extract(miceadds::load.Rdata2(filename = "IgG_RBD_naive_mRNA.Rdata", path=here("results/simple_decay_fits/")))
-single_RBD_rec_nomRNA <- rstan::extract(miceadds::load.Rdata2(filename = "IgG_RBD_rec_nomRNA.Rdata", path=here("results/simple_decay_fits/")))
-single_RBD_naive_nomRNA <- rstan::extract(miceadds::load.Rdata2(filename = "IgG_RBD_naive_nomRNA.Rdata", path=here("results/simple_decay_fits/")))
-single_RBD_rec_none <- rstan::extract(miceadds::load.Rdata2(filename = "IgG_RBD_rec_none.Rdata", path=here("results/simple_decay_fits/")))
-
-
-RBD_model_decays <- rbind(tibble(d_l = RBD_naive_mRNA$dl_mu,
-       d_a = RBD_naive_mRNA$da_mu,
-       d_s = RBD_naive_mRNA$ds_mu) %>% mutate(Vaccine = "mRNA", Cohort = "Naive", Model = "Bi-phasic decay"),
-      tibble(d_l = RBD_naive_nomRNA$dl_mu,
-       d_a = RBD_naive_nomRNA$da_mu,
-       d_s = RBD_naive_nomRNA$ds_mu) %>% mutate(Vaccine = "non-mRNA", Cohort = "Naive", Model = "Bi-phasic decay"),
-      tibble(d_l = RBD_rec_mRNA$dl_mu,
-       d_a = RBD_rec_mRNA$da_mu,
-       d_s = RBD_rec_mRNA$ds_mu) %>% mutate(Vaccine = "mRNA", Cohort = "Recovered", Model = "Bi-phasic decay"),
-      tibble(d_l = RBD_rec_nomRNA$dl_mu,
-       d_a = RBD_rec_nomRNA$da_mu,
-       d_s = RBD_rec_nomRNA$ds_mu) %>% mutate(Vaccine = "non-mRNA", Cohort = "Recovered", Model = "Bi-phasic decay"),
-      tibble(d_l = rec_none_rbd$dl_mu,
-       d_a = rec_none_rbd$da_mu,
-       d_s = rec_none_rbd$ds_mu) %>% mutate(Vaccine = "None", Cohort = "Recovered", Model = "Bi-phasic decay"),
-      tibble(d_l = single_RBD_naive_mRNA$lambda_mu,
-             d_a = NA,
-             d_s = NA) %>% mutate(Vaccine = "mRNA", Cohort = "Naive", Model = "Single decay"),
-      tibble(d_l = single_RBD_naive_nomRNA$lambda_mu,
-             d_a = NA,
-             d_s = NA) %>% mutate(Vaccine = "non-mRNA", Cohort = "Naive", Model = "Single decay"),
-      tibble(d_l = single_RBD_rec_mRNA$lambda_mu,
-             d_a = NA,
-             d_s = NA) %>% mutate(Vaccine = "mRNA", Cohort = "Recovered", Model = "Single decay"),
-      tibble(d_l = single_RBD_rec_nomRNA$lambda_mu,
-             d_a = NA,
-             d_s = NA) %>% mutate(Vaccine = "non-mRNA", Cohort = "Recovered", Model = "Single decay"),
-      tibble(d_l = single_RBD_rec_none$lambda_mu,
-             d_a = NA,
-             d_s = NA) %>% mutate(Vaccine = "None", Cohort = "Recovered", Model = "Single decay"))
-
-
-melted_RBD_model_decays <- RBD_model_decays %>% melt()
-
-melted_RBD_model_decays$variable <- factor(melted_RBD_model_decays$variable, 
-                        labels = c(d_l = expression("Half-life of the antibody response (" *mu[d[l]]~ "&" ~lambda* ")"),
-                                  d_a = expression("Half-life of IgG ("*mu[d[a]]*")"),
-                                  d_s = expression("Half-life of SLPCs ("*mu[d[s]]*")")))
-
-
-ggplot(data = melted_RBD_model_decays %>% group_by(Vaccine, Cohort, Model, variable) %>% reframe(ci_min = unlist(ci(value, ci = 0.95))[2], ci_max = unlist(ci(value, ci = 0.95))[3], median = median(value))) + geom_errorbar(aes(y = Cohort, xmin = ci_min, xmax = ci_max, colour = Model), position = position_dodge(width = .75), width = .45, linewidth = 1) + geom_point(aes(y = Cohort, x = median, colour = Model), position = position_dodge(width = .75), size = 3) + facet_grid(Vaccine ~ variable, scale = "free_x", labeller = label_parsed) + xlab("Half-life (days)") + theme(axis.text=element_text(size=16), axis.title=element_text(size=16), strip.text = element_text(size = 16), legend.text=element_text(size=16), plot.title = element_text(size=18), legend.title=element_text(size=18)) 
-
-
-ggsave(here("results/paper_plots/model_decay_rates_RBD.png"), width = 18, height = 15, dpi = 300)
-```
-
-
-```{r}
-single_spike_rec_mRNA <-  rstan::extract(miceadds::load.Rdata2(filename = "IgG_spike_rec_mRNA.Rdata", path=here("results/simple_decay_fits/")))
-single_spike_naive_mRNA <- rstan::extract(miceadds::load.Rdata2(filename = "IgG_spike_naive_mRNA.Rdata", path=here("results/simple_decay_fits/")))
-single_spike_rec_nomRNA <- rstan::extract(miceadds::load.Rdata2(filename = "IgG_spike_rec_nomRNA.Rdata", path=here("results/simple_decay_fits/")))
-single_spike_naive_nomRNA <- rstan::extract(miceadds::load.Rdata2(filename = "IgG_spike_naive_nomRNA.Rdata", path=here("results/simple_decay_fits/")))
-single_spike_rec_none <- rstan::extract(miceadds::load.Rdata2(filename = "IgG_spike_rec_none.Rdata", path=here("results/simple_decay_fits/")))
-single_RBD_rec_mRNA <- rstan::extract(miceadds::load.Rdata2(filename = "IgG_RBD_rec_mRNA.Rdata", path=here("results/simple_decay_fits/")))
-single_RBD_naive_mRNA <- rstan::extract(miceadds::load.Rdata2(filename = "IgG_RBD_naive_mRNA.Rdata", path=here("results/simple_decay_fits/")))
-single_RBD_rec_nomRNA <- rstan::extract(miceadds::load.Rdata2(filename = "IgG_RBD_rec_nomRNA.Rdata", path=here("results/simple_decay_fits/")))
-single_RBD_naive_nomRNA <- rstan::extract(miceadds::load.Rdata2(filename = "IgG_RBD_naive_nomRNA.Rdata", path=here("results/simple_decay_fits/")))
-single_RBD_rec_none <- rstan::extract(miceadds::load.Rdata2(filename = "IgG_RBD_rec_none.Rdata", path=here("results/simple_decay_fits/")))
-
-
-model_ab_response_decays <- rbind(tibble(d_l = spike_naive_mRNA$dl_mu) %>% mutate(Vaccine = "mRNA", Cohort = "Naive", Model = "Bi-phasic decay", antigen = "Spike"),
-      tibble(d_l = spike_naive_nomRNA$dl_mu) %>% mutate(Vaccine = "non-mRNA", Cohort = "Naive", Model = "Bi-phasic decay", antigen = "Spike"),
-      tibble(d_l = spike_rec_mRNA$dl_mu) %>% mutate(Vaccine = "mRNA", Cohort = "Recovered", Model = "Bi-phasic decay", antigen = "Spike"),
-      tibble(d_l = spike_rec_nomRNA$dl_mu) %>% mutate(Vaccine = "non-mRNA", Cohort = "Recovered", Model = "Bi-phasic decay", antigen = "Spike"),
-      tibble(d_l = spike_rec_none$dl_mu) %>% mutate(Vaccine = "None", Cohort = "Recovered", Model = "Bi-phasic decay", antigen = "Spike"),
-      tibble(d_l = single_spike_naive_mRNA$lambda_mu) %>% mutate(Vaccine = "mRNA", Cohort = "Naive", Model = "Single decay", antigen = "Spike"),
-      tibble(d_l = single_spike_naive_nomRNA$lambda_mu) %>% mutate(Vaccine = "non-mRNA", Cohort = "Naive", Model = "Single decay", antigen = "Spike"),
-      tibble(d_l = single_spike_rec_mRNA$lambda_mu) %>% mutate(Vaccine = "mRNA", Cohort = "Recovered", Model = "Single decay", antigen = "Spike"),
-      tibble(d_l = single_spike_rec_nomRNA$lambda_mu) %>% mutate(Vaccine = "non-mRNA", Cohort = "Recovered", Model = "Single decay", antigen = "Spike"),
-      tibble(d_l = single_spike_rec_none$lambda_mu) %>% mutate(Vaccine = "None", Cohort = "Recovered", Model = "Single decay", antigen = "Spike"),
-      tibble(d_l = RBD_naive_mRNA$dl_mu) %>% mutate(Vaccine = "mRNA", Cohort = "Naive", Model = "Bi-phasic decay", antigen = "RBD"),
-      tibble(d_l = RBD_naive_nomRNA$dl_mu) %>% mutate(Vaccine = "non-mRNA", Cohort = "Naive", Model = "Bi-phasic decay", antigen = "RBD"),
-      tibble(d_l = RBD_rec_mRNA$dl_mu) %>% mutate(Vaccine = "mRNA", Cohort = "Recovered", Model = "Bi-phasic decay", antigen = "RBD"),
-      tibble(d_l = RBD_rec_nomRNA$dl_mu) %>% mutate(Vaccine = "non-mRNA", Cohort = "Recovered", Model = "Bi-phasic decay", antigen = "RBD"),
-      tibble(d_l = RBD_rec_none$dl_mu) %>% mutate(Vaccine = "None", Cohort = "Recovered", Model = "Bi-phasic decay", antigen = "RBD"),
-      tibble(d_l = single_RBD_naive_mRNA$lambda_mu) %>% mutate(Vaccine = "mRNA", Cohort = "Naive", Model = "Single decay", antigen = "RBD"),
-      tibble(d_l = single_RBD_naive_nomRNA$lambda_mu) %>% mutate(Vaccine = "non-mRNA", Cohort = "Naive", Model = "Single decay", antigen = "RBD"),
-      tibble(d_l = single_RBD_rec_mRNA$lambda_mu) %>% mutate(Vaccine = "mRNA", Cohort = "Recovered", Model = "Single decay", antigen = "RBD"),
-      tibble(d_l = single_RBD_rec_nomRNA$lambda_mu) %>% mutate(Vaccine = "non-mRNA", Cohort = "Recovered", Model = "Single decay", antigen = "RBD"),
-      tibble(d_l = single_RBD_rec_none$lambda_mu) %>% mutate(Vaccine = "None", Cohort = "Recovered", Model = "Single decay", antigen = "RBD"))
+model_ab_response_decays <- rbind(tibble(d_l = bp_naive_mRNA_spike$dl_mu) %>% mutate(Vaccine = "mRNA", Cohort = "Naive", Model = "Bi-phasic decay", antigen = "Spike"),
+      tibble(d_l = bp_naive_nomRNA_spike$dl_mu) %>% mutate(Vaccine = "non-mRNA", Cohort = "Naive", Model = "Bi-phasic decay", antigen = "Spike"),
+      tibble(d_l = bp_rec_mRNA_spike$dl_mu) %>% mutate(Vaccine = "mRNA", Cohort = "Recovered", Model = "Bi-phasic decay", antigen = "Spike"),
+      tibble(d_l = bp_rec_nomRNA_spike$dl_mu) %>% mutate(Vaccine = "non-mRNA", Cohort = "Recovered", Model = "Bi-phasic decay", antigen = "Spike"),
+      tibble(d_l = bp_rec_none_spike$dl_mu) %>% mutate(Vaccine = "None", Cohort = "Recovered", Model = "Bi-phasic decay", antigen = "Spike"),
+      tibble(d_l = sp_naive_mRNA_spike$lambda_mu) %>% mutate(Vaccine = "mRNA", Cohort = "Naive", Model = "Mono-phasic decay", antigen = "Spike"),
+      tibble(d_l = sp_naive_nomRNA_spike$lambda_mu) %>% mutate(Vaccine = "non-mRNA", Cohort = "Naive", Model = "Mono-phasic decay", antigen = "Spike"),
+      tibble(d_l = sp_rec_mRNA_spike$lambda_mu) %>% mutate(Vaccine = "mRNA", Cohort = "Recovered", Model = "Mono-phasic decay", antigen = "Spike"),
+      tibble(d_l = sp_rec_nomRNA_spike$lambda_mu) %>% mutate(Vaccine = "non-mRNA", Cohort = "Recovered", Model = "Mono-phasic decay", antigen = "Spike"),
+      tibble(d_l = sp_rec_none_spike$lambda_mu) %>% mutate(Vaccine = "None", Cohort = "Recovered", Model = "Mono-phasic decay", antigen = "Spike"),
+      tibble(d_l = bp_naive_mRNA_rbd$dl_mu) %>% mutate(Vaccine = "mRNA", Cohort = "Naive", Model = "Bi-phasic decay", antigen = "RBD"),
+      tibble(d_l = bp_naive_nomRNA_rbd$dl_mu) %>% mutate(Vaccine = "non-mRNA", Cohort = "Naive", Model = "Bi-phasic decay", antigen = "RBD"),
+      tibble(d_l = bp_rec_mRNA_rbd$dl_mu) %>% mutate(Vaccine = "mRNA", Cohort = "Recovered", Model = "Bi-phasic decay", antigen = "RBD"),
+      tibble(d_l = bp_rec_nomRNA_rbd$dl_mu) %>% mutate(Vaccine = "non-mRNA", Cohort = "Recovered", Model = "Bi-phasic decay", antigen = "RBD"),
+      tibble(d_l = bp_rec_none_rbd$dl_mu) %>% mutate(Vaccine = "None", Cohort = "Recovered", Model = "Bi-phasic decay", antigen = "RBD"),
+      tibble(d_l = sp_naive_mRNA_rbd$lambda_mu) %>% mutate(Vaccine = "mRNA", Cohort = "Naive", Model = "Mono-phasic decay", antigen = "RBD"),
+      tibble(d_l = sp_naive_nomRNA_rbd$lambda_mu) %>% mutate(Vaccine = "non-mRNA", Cohort = "Naive", Model = "Mono-phasic decay", antigen = "RBD"),
+      tibble(d_l = sp_rec_mRNA_rbd$lambda_mu) %>% mutate(Vaccine = "mRNA", Cohort = "Recovered", Model = "Mono-phasic decay", antigen = "RBD"),
+      tibble(d_l = sp_rec_nomRNA_rbd$lambda_mu) %>% mutate(Vaccine = "non-mRNA", Cohort = "Recovered", Model = "Mono-phasic decay", antigen = "RBD"),
+      tibble(d_l = sp_rec_none_rbd$lambda_mu) %>% mutate(Vaccine = "None", Cohort = "Recovered", Model = "Mono-phasic decay", antigen = "RBD"))
 
 
 melted_ab_response_decays <- model_ab_response_decays %>% melt()
 
 melted_ab_response_decays$variable <- factor(melted_ab_response_decays$antigen, 
-                        labels = c(Spike = expression("Half-life of the IgG response to spike"),
-                                   RBD = expression("Half-life of the IgG response to RBD")))
+                        labels = c(Spike = expression("Half-life of the IgG\nresponse to spike"),
+                                   RBD = expression("Half-life of the IgG\nresponse to RBD")))
+
+plot_decay_data <- melted_ab_response_decays %>% group_by(Vaccine, Cohort, Model, variable, antigen) %>% reframe(ci_min = unlist(ci(value, ci = 0.95))[2], ci_max = unlist(ci(value, ci = 0.95))[3], median = median(value))
+
+ggplot(plot_decay_data) + 
+  geom_errorbar(aes(y = Cohort, xmin = ci_min, xmax = ci_max, colour = Model), position = position_dodge(width = .75), width = .45, linewidth = 1) +
+  geom_point(aes(y = Cohort, x = median, colour = Model), position = position_dodge(width = .75), size = 3) + 
+  facet_grid(Vaccine ~ antigen, labeller = as_labeller(c("Spike" = "Half-life of the IgG\nresponse to spike protein", "RBD" = "Half-life of the IgG\nresponse to RBD protein", "non-mRNA" = "non-mRNA", "mRNA" = "mRNA", "None" = "None"))) + 
+  xlab("Half-life (days)") + 
+  theme_bw() +
+  theme(axis.text=element_text(size=22), axis.title=element_text(size=22), strip.text = element_text(size = 22), legend.text=element_text(size=22), plot.title = element_text(size=24), legend.title=element_text(size=22), panel.grid.major = element_blank(), panel.grid.minor = element_blank()) 
 
 
-ggplot(data = melted_ab_response_decays %>% group_by(Vaccine, Cohort, Model, variable, antigen) %>% reframe(ci_min = unlist(ci(value, ci = 0.95))[2], ci_max = unlist(ci(value, ci = 0.95))[3], median = median(value))) + geom_errorbar(aes(y = Cohort, xmin = ci_min, xmax = ci_max, colour = Model), position = position_dodge(width = .75), width = .45, linewidth = 1) + geom_point(aes(y = Cohort, x = median, colour = Model), position = position_dodge(width = .75), size = 3) + facet_grid(Vaccine ~ antigen, labeller = as_labeller(c("Spike" = "Half-life of the IgG response to spike protein", "RBD" = "Half-life of the IgG response to RBD protein", "non-mRNA" = "non-mRNA", "mRNA" = "mRNA", "None" = "None"))) + xlab("Half-life (days)") + theme(axis.text=element_text(size=16), axis.title=element_text(size=16), strip.text = element_text(size = 16), legend.text=element_text(size=16), plot.title = element_text(size=18), legend.title=element_text(size=18), panel.grid.major = element_blank(), panel.grid.minor = element_blank()) 
-
-
-ggsave(here("results/paper_plots/ab_response_decay_rates.png"), width = 20, height = 10, dpi = 300)
+ggsave(here("results/paper_plots_revised/ab_response_decay_rates.png"), width = 14, height = 7, dpi = 300)
+ggsave(here("results/paper_plots_revised/ab_response_decay_rates.pdf"), width = 14, height = 7, dpi = 300)
 ```
 
 
 
-
+Plot boosting parameters from BP model.
 ```{r}
-inf_plot_data <- rbind(tibble(beta = RBD_naive_mRNA$beta_mu,
-       # rho = RBD_naive_mRNA$rho_mu,
-       m = RBD_naive_mRNA$multiplier_mu) %>% mutate(vaccine = "mRNA", cohort = "Naive", antigen = "RBD"),
-      tibble(beta = RBD_naive_nomRNA$beta_mu,
-       # rho = RBD_naive_nomRNA$rho_mu,
-       m = RBD_naive_nomRNA$multiplier_mu) %>% mutate(vaccine = "non-mRNA", cohort = "Naive", antigen = "RBD"),
-      tibble(beta = RBD_rec_mRNA$beta_mu,     
-       # rho = RBD_rec_mRNA$rho_mu,
-       m = RBD_rec_mRNA$multiplier_mu) %>% mutate(vaccine = "mRNA", cohort = "Recovered", antigen = "RBD"),
-      tibble(beta = RBD_rec_nomRNA$beta_mu,
-       # rho = RBD_rec_nomRNA$rho_mu,
-       m = RBD_rec_nomRNA$multiplier_mu) %>% mutate(vaccine = "non-mRNA", cohort = "Recovered", antigen = "RBD"),
-      tibble(beta = RBD_rec_none$beta_mu,
-       # rho = RBD_rec_none$rho_mu,
+inf_plot_data <- rbind(tibble(beta = bp_naive_mRNA_rbd$beta_mu,
+       m = bp_naive_mRNA_rbd$multiplier_mu) %>% mutate(vaccine = "mRNA", cohort = "Naive", antigen = "RBD"),
+      tibble(beta = bp_naive_nomRNA_rbd$beta_mu,
+       m = bp_naive_nomRNA_rbd$multiplier_mu) %>% mutate(vaccine = "non-mRNA", cohort = "Naive", antigen = "RBD"),
+      tibble(beta = bp_rec_mRNA_rbd$beta_mu,     
+       m = bp_rec_mRNA_rbd$multiplier_mu) %>% mutate(vaccine = "mRNA", cohort = "Recovered", antigen = "RBD"),
+      tibble(beta = bp_rec_nomRNA_rbd$beta_mu,
+       m = bp_rec_nomRNA_rbd$multiplier_mu) %>% mutate(vaccine = "non-mRNA", cohort = "Recovered", antigen = "RBD"),
+      tibble(beta = bp_rec_none_rbd$beta_mu,
        m = NA) %>% mutate(vaccine = "None", cohort = "Recovered", antigen = "RBD"),
-      tibble(beta = spike_naive_mRNA$beta_mu,
-       # rho = spike_naive_mRNA$rho_mu,
-       m = spike_naive_mRNA$multiplier_mu) %>% mutate(vaccine = "mRNA", cohort = "Naive", antigen = "Spike"),
-      tibble(beta = spike_naive_nomRNA$beta_mu,
-       # rho = spike_naive_nomRNA$rho_mu,
-       m = spike_naive_nomRNA$multiplier_mu) %>% mutate(vaccine = "non-mRNA", cohort = "Naive", antigen = "Spike"),
-      tibble(beta = spike_rec_mRNA$beta_mu,     
-       # rho = spike_rec_mRNA$rho_mu,
-       m = spike_rec_mRNA$multiplier_mu) %>% mutate(vaccine = "mRNA", cohort = "Recovered", antigen = "Spike"),
-      tibble(beta = spike_rec_nomRNA$beta_mu,
-       # rho = spike_rec_nomRNA$rho_mu,
-       m = spike_rec_nomRNA$multiplier_mu) %>% mutate(vaccine = "non-mRNA", cohort = "Recovered", antigen = "Spike"),
-      tibble(beta = spike_rec_none$beta_mu,
-       # rho = spike_rec_none$rho_mu,
+      tibble(beta = bp_naive_mRNA_spike$beta_mu,
+       m = bp_naive_mRNA_spike$multiplier_mu) %>% mutate(vaccine = "mRNA", cohort = "Naive", antigen = "Spike"),
+      tibble(beta = bp_naive_nomRNA_spike$beta_mu,
+       m = bp_naive_nomRNA_spike$multiplier_mu) %>% mutate(vaccine = "non-mRNA", cohort = "Naive", antigen = "Spike"),
+      tibble(beta = bp_rec_mRNA_spike$beta_mu,     
+       m = bp_rec_mRNA_spike$multiplier_mu) %>% mutate(vaccine = "mRNA", cohort = "Recovered", antigen = "Spike"),
+      tibble(beta = bp_rec_nomRNA_spike$beta_mu,
+       m = bp_rec_nomRNA_spike$multiplier_mu) %>% mutate(vaccine = "non-mRNA", cohort = "Recovered", antigen = "Spike"),
+      tibble(beta = bp_rec_none_spike$beta_mu,
        m = NA) %>% mutate(vaccine = "None", cohort = "Recovered", antigen = "Spike"))
 
 melted_inf_data_plot <- melt(inf_plot_data)
 
-priors_melted <- rbind(tibble(beta = rlnorm(length(RBD_naive_nomRNA$beta_mu), lognormal_mean(1500, 0.3), 0.3),
-                 # rho = rbeta(length(RBD_naive_nomRNA$rho_mu), 5, 2),
-                 m = rlnorm(length(RBD_naive_nomRNA$multiplier_mu), lognormal_mean(5, 0.5), 0.5)) %>% mutate(vaccine = "mRNA", cohort = "Recovered", antigen = "Prior"),
-                 tibble(beta = rlnorm(length(RBD_naive_nomRNA$beta_mu), lognormal_mean(1500, 0.3), 0.3),
-                 # rho = rbeta(length(RBD_naive_nomRNA$rho_mu), 5, 2),
-                 m = rlnorm(length(RBD_naive_nomRNA$multiplier_mu), lognormal_mean(5, 0.5), 0.5)) %>% mutate(vaccine = "mRNA", cohort = "Naive", antigen = "Prior"),
-                 tibble(beta = rlnorm(length(RBD_naive_nomRNA$beta_mu), lognormal_mean(1500, 0.3), 0.3),
-                 # rho = rbeta(length(RBD_naive_nomRNA$rho_mu), 5, 2),
-                 m = rlnorm(length(RBD_naive_nomRNA$multiplier_mu), lognormal_mean(5, 0.5), 0.5)) %>% mutate(vaccine = "non-mRNA", cohort = "Recovered", antigen = "Prior"),
-                 tibble(beta = rlnorm(length(RBD_naive_nomRNA$beta_mu), lognormal_mean(1500, 0.3), 0.3),
-                 # rho = rbeta(length(RBD_naive_nomRNA$rho_mu), 5, 2),
-                 m = rlnorm(length(RBD_naive_nomRNA$multiplier_mu), lognormal_mean(5, 0.5), 0.5)) %>% mutate(vaccine = "non-mRNA", cohort = "Naive", antigen = "Prior"),
-                 tibble(beta = rlnorm(length(RBD_naive_nomRNA$beta_mu), lognormal_mean(1500, 0.3), 0.3),
-                 # rho = rbeta(length(RBD_naive_nomRNA$rho_mu), 5, 2),
+priors_melted <- rbind(tibble(beta = rlnorm(length(bp_naive_mRNA_rbd$beta_mu), lognormal_mean(1500, 0.3), 0.3),
+                 m = rlnorm(length(bp_naive_mRNA_rbd$multiplier_mu), lognormal_mean(5, 0.5), 0.5)) %>% mutate(vaccine = "mRNA", cohort = "Recovered", antigen = "Prior"),
+                 tibble(beta = rlnorm(length(bp_naive_mRNA_rbd$beta_mu), lognormal_mean(1500, 0.3), 0.3),
+                 m = rlnorm(length(bp_naive_mRNA_rbd$multiplier_mu), lognormal_mean(5, 0.5), 0.5)) %>% mutate(vaccine = "mRNA", cohort = "Naive", antigen = "Prior"),
+                 tibble(beta = rlnorm(length(bp_naive_mRNA_rbd$beta_mu), lognormal_mean(1500, 0.3), 0.3),
+                 m = rlnorm(length(bp_naive_mRNA_rbd$multiplier_mu), lognormal_mean(5, 0.5), 0.5)) %>% mutate(vaccine = "non-mRNA", cohort = "Recovered", antigen = "Prior"),
+                 tibble(beta = rlnorm(length(bp_naive_mRNA_rbd$beta_mu), lognormal_mean(1500, 0.3), 0.3),
+                 m = rlnorm(length(bp_naive_mRNA_rbd$multiplier_mu), lognormal_mean(5, 0.5), 0.5)) %>% mutate(vaccine = "non-mRNA", cohort = "Naive", antigen = "Prior"),
+                 tibble(beta = rlnorm(length(bp_naive_mRNA_rbd$beta_mu), lognormal_mean(1500, 0.3), 0.3),
                  m = NA) %>% mutate(vaccine = "None", cohort = "Recovered", antigen = "Prior")) %>% melt()
 
 melted_inf_data_plot$variable <- factor(melted_inf_data_plot$variable, 
-                        labels = c(beta = expression("Increase in antibodies per day post exposure ("*mu[beta]*")"),
-                        # rho = expression("Proportion of short-lived plasma cells ("*mu[rho]*")"),
-                        m = expression("Fold change in" ~beta~ "after first exposure ("*mu[italic(m)]*")")))
+                        labels = c(beta = expression("Increase in antibodies \nper day post exposure ("*mu[beta]*")"),
+                        m = expression("Fold change in antibody \nincrease across exposures ("*mu[italic(m)]*")")))
 
 priors_melted$variable <- factor(priors_melted$variable, 
-                        labels = c(beta = expression("Increase in antibodies per day post exposure ("*mu[beta]*")"),
-                        # rho = expression("Proportion of short-lived plasma cells ("*mu[rho]*")"),
-                        m = expression("Fold change in" ~beta~ "after first exposure ("*mu[italic(m)]*")")))
+                        labels = c(beta = expression("Increase in antibodies \nper day post exposure ("*mu[beta]*")"),
+                        m = expression("Fold change in antibody \nincrease across exposures ("*mu[italic(m)]*")")))
 
 melted_plot_data <- rbind(melted_inf_data_plot, priors_melted)
 
 melted_plot_data %>% 
   ggplot(aes(value)) + 
   geom_density(aes(fill = antigen, alpha = antigen, size = antigen)) + scale_alpha_manual(values = c(Prior = 0, RBD = 0.4, Spike = 0.4)) + scale_size_manual(values = c(Prior = 0.8, RBD = 0.5, Spike = 0.5)) +
-  facet_nested(vaccine + cohort ~ variable, scales="free", independent = "all", labeller = label_parsed) + theme(
-    strip.text.x = element_text(size = 18)) + labs(fill = "Antigen response", alpha = "Antigen response", size = "Antigen response") + theme(axis.text=element_text(size=16), axis.title=element_text(size=16), strip.text = element_text(size = 16), legend.text=element_text(size=16), legend.title=element_text(size=16), plot.title = element_text(size=18), panel.grid.major = element_blank(), panel.grid.minor = element_blank()) + 
+  facet_nested(cohort + vaccine ~ variable, scales="free", independent = "all", labeller = label_parsed) + 
+  theme_bw() + 
+  labs(fill = "Antigen\nresponse", alpha = "Antigen\nresponse", size = "Antigen\nresponse") + 
+  theme(strip.text.x = element_text(size = 30, margin = margin(t = 40, b = 5)), axis.text=element_text(size=30), axis.title=element_text(size=30), strip.text = element_text(size = 30), legend.text=element_text(size=30), legend.title=element_text(size=30), plot.title = element_text(size=32), panel.grid.major = element_blank(), panel.grid.minor = element_blank()) + 
   facetted_pos_scales(x = list(
-                      variable == expression("Increase in antibodies per day post exposure ("*mu[beta]*")") ~ scale_x_continuous(limits = c(min(inf_plot_data$beta, na.rm = T), max(inf_plot_data$beta, na.rm = T))),
-                      # variable == expression("Proportion of short-lived plasma cells ("*mu[rho]*")") ~ scale_x_continuous(limits = c(min(inf_plot_data$rho, na.rm = T), max(inf_plot_data$rho, na.rm = T))),
-                      variable == expression("Fold change in" ~beta~ "after first exposure ("*mu[italic(m)]*")") ~ scale_x_continuous(limits = c(min(inf_plot_data$m, na.rm = T), max(inf_plot_data$m, na.rm = T)))
+                      variable == expression("Increase in antibodies \nper day post exposure ("*mu[beta]*")") ~ scale_x_continuous(limits = c(min(inf_plot_data$beta, na.rm = T), max(inf_plot_data$beta, na.rm = T))),
+                      variable == expression("Fold change in antibody \nincrease across exposures ("*mu[italic(m)]*")") ~ scale_x_continuous(limits = c(min(inf_plot_data$m, na.rm = T), max(inf_plot_data$m, na.rm = T)))
   )) + xlab("Parameter value") + ylab("Probability density")
 
-ggsave(here("results/paper_plots/boosting_pop_param_estimates.png"), width = 22, height = 13, dpi = 300)
 
+ggsave(here("results/paper_plots_revised/boosting_pop_param_estimates.png"), width = 27, height = 17, dpi = 300)
+ggsave(here("results/paper_plots_revised/boosting_pop_param_estimates.pdf"), width = 27, height = 17, dpi = 300)
 
 
 ```
 
 
-
+Plot model fits for SP and BP model side-by-side for sample individual.
 ```{r}
-biphasic_model_results <- rstan::extract(IgG_spike_rec_nomRNA)
-single_model_results <- rstan::extract(miceadds::load.Rdata2(filename = "IgG_spike_rec_nomRNA.Rdata", path=here("results/simple_decay_fits/")))
-
-biphasic_model_data <- rec_nomRNA_spike_stan_data
-single_model_data <- miceadds::load.Rdata2(filename = "IgG_spike_rec_nomRNA_data.Rdata", path=here("results/simple_decay_fits/"))
-
-biphasic_pis <- predictive_interval(as.matrix(IgG_spike_rec_nomRNA), prob = 0.95)
-single_pis <- predictive_interval(as.matrix(miceadds::load.Rdata2(filename = "IgG_spike_rec_nomRNA.Rdata", path=here("results/simple_decay_fits/"))), prob = 0.95)
-
-biphasic_indexes <- grepl("^y_rep[[0-9]+\\]$", row.names(biphasic_pis))
-single_indexes <- grepl("^y_rep[[0-9]+\\]$", row.names(single_pis))
-
-biphasic_yrep_pis <- biphasic_pis[biphasic_indexes, ]
-single_yrep_pis <- single_pis[single_indexes, ]
-biphasic_yrep_pis <- cbind(biphasic_yrep_pis, medians = colMedians(biphasic_model_results$y_rep))
-single_yrep_pis <- cbind(single_yrep_pis, medians = colMedians(single_model_results$y_rep))
-
-single_id_size <- c()
-filtered_ids <- unique(covid_recovered_nomRNA$Record.ID)[which(single_model_data$no_segments != 0)]
-pos <- 1
-for (i in 1:length(single_model_data$no_segments)) {
-  size <- 0
-  for (j in 1:single_model_data$no_segments[i]) {
-    size <- size + single_model_data$size_segments[pos]
-    pos <- pos + 1
+bp_sp_model_fits <- function(bp_results, bp_data, sp_results, sp_data) {
+  biphasic_pis <- predictive_interval(bp_results$y_rep, prob = 0.95)
+  single_pis <- predictive_interval(sp_results$y_rep, prob = 0.95)
+  
+  bp_yrep_pis <- cbind(biphasic_pis, medians = colMedians(bp_results$y_rep))
+  sp_yrep_pis <- cbind(single_pis, medians = colMedians(sp_results$y_rep))
+  
+  sp_id_size <- c()
+  pos <- 1
+  for (i in 1:length(sp_data$no_segments)) {
+    size <- 0
+    for (j in 1:sp_data$no_segments[i]) {
+      size <- size + sp_data$size_segments[pos]
+      pos <- pos + 1
+    }
+    sp_id_size <- c(sp_id_size, size)
   }
-  single_id_size <- c(single_id_size, size)
+  bp_ids <- rep(bp_data$ids, each=bp_data$Nyt)
+  sp_ids <- rep(sp_data$ids, sp_id_size)
+
+  biphasic_plot_data <- as.data.frame(bp_yrep_pis) %>% mutate(days = rep(bp_data$yrep_times, bp_data$K), ID = bp_ids)
+  single_plot_data <- as.data.frame(sp_yrep_pis) %>% mutate(days = sp_data$og_times, ID = sp_ids)
+
+  biphasic_plot_data <- as.data.frame(lapply(biphasic_plot_data, unlist)) %>% mutate(Model = "Bi-phasic decay model fit")
+  single_plot_data <- as.data.frame(lapply(single_plot_data, unlist)) %>% mutate(Model = "Mono-phasic decay model fit") %>% group_by(ID) %>% mutate(group = cumsum(lag(medians, default = first(medians)) < medians) + 1)
+
+  stan_input <- tibble(y = bp_data$y, time = bp_data$time, ID = rep(bp_data$ids, bp_data$size_y))
+  biphasic_plot_data <- biphasic_plot_data %>% group_by(ID) %>% inner_join(stan_input %>% group_by(ID) %>% summarise(max_time = max(time)), by="ID") %>%   filter(days < max_time+10)
+
+  random_id <- "LVCC-0087"
+  # random_id <- sample(bp_data$ids, 1)
+
+  ggplot() + 
+    geom_point(data = stan_input %>% 
+                 filter(ID == random_id), 
+               aes(x = time, y = y, colour = "Observed data"), size = 3) +
+  geom_ribbon(data = biphasic_plot_data %>% 
+                filter(ID == random_id), 
+              aes(x = days, ymin = X2.5., ymax = X97.5., fill = "95% posterior\npredictive interval"), alpha = 0.2) +
+  geom_line(data = biphasic_plot_data %>% 
+              filter(ID == random_id), 
+            aes(x = days, y = medians, colour = "Posterior\npredictive median"), linetype = "dashed", size = 1) +
+  geom_ribbon(data = single_plot_data %>% 
+                filter(ID == random_id), 
+              aes(x = days, ymin = X2.5., ymax = X97.5., group = group, fill = "95% posterior\npredictive interval"), alpha = 0.2) +
+  geom_line(data = single_plot_data %>% 
+              filter(ID == random_id), 
+            aes(x = days, y = medians, group = group, colour = "Posterior\npredictive median"), linetype = "dashed", size = 1) +
+    ylab("Adjusted MFI") + 
+    xlab("Time since first exposure (days)") + 
+    theme_bw() +
+    theme(axis.text=element_text(size=25), axis.title=element_text(size=25), strip.text = element_text(size = 25), legend.text=element_text(size=25), plot.title = element_text(size=27), panel.grid.major = element_blank(), panel.grid.minor = element_blank(), legend.title=element_blank()) + 
+    facet_grid(ID ~ Model) + 
+    scale_colour_manual(values = c("Observed data" = "black", "Posterior\npredictive median" = "black")) + scale_fill_manual(values = c("95% posterior\npredictive interval" = "blue"))
 }
 
-biphasic_ids <- rep(unique(covid_recovered_nomRNA$Record.ID), rec_nomRNA_spike_stan_data$size_y)
-single_ids <- rep(filtered_ids, single_id_size)
+naive_mRNA_spike <- bp_sp_model_fits(bp_naive_mRNA_spike, IgG_Spike_naive_mRNA_data, sp_naive_mRNA_spike, sp_IgG_Spike_naive_mRNA_data)
+naive_mRNA_rbd <- bp_sp_model_fits(bp_naive_mRNA_rbd, IgG_RBD_naive_mRNA_data, sp_naive_mRNA_rbd, sp_IgG_RBD_naive_mRNA_data)
 
-biphasic_plot_data <- as.data.frame(biphasic_yrep_pis) %>% mutate(days = rec_nomRNA_spike_stan_data$time, ID = biphasic_ids)
-single_plot_data <- as.data.frame(single_yrep_pis) %>% mutate(days = single_model_data$og_times, ID = single_ids)
+rec_mRNA_spike <- bp_sp_model_fits(bp_rec_mRNA_spike, IgG_Spike_recovered_mRNA_data, sp_rec_mRNA_spike, sp_IgG_Spike_recovered_mRNA_data)
+rec_mRNA_rbd <- bp_sp_model_fits(bp_rec_mRNA_rbd, IgG_RBD_recovered_mRNA_data, sp_rec_mRNA_rbd, sp_IgG_RBD_recovered_mRNA_data)
 
-biphasic_plot_data <- as.data.frame(lapply(biphasic_plot_data, unlist)) %>% mutate(Model = "Bi-phasic decay model fit")
-single_plot_data <- as.data.frame(lapply(single_plot_data, unlist)) %>% mutate(Model = "Single decay model fit") %>% group_by(ID) %>% mutate(group = cumsum(lag(medians, default = first(medians)) < medians) + 1)
+naive_nomRNA_spike <- bp_sp_model_fits(bp_naive_nomRNA_spike, IgG_Spike_naive_nomRNA_data, sp_naive_nomRNA_spike, sp_IgG_Spike_naive_nomRNA_data)
+naive_nomRNA_rbd <- bp_sp_model_fits(bp_naive_nomRNA_rbd, IgG_RBD_naive_nomRNA_data, sp_naive_nomRNA_rbd, sp_IgG_RBD_naive_nomRNA_data)
 
-stan_input <- tibble(y = rec_nomRNA_spike_stan_data$y, time = rec_nomRNA_spike_stan_data$time, ID = rep(filtered_ids, rec_nomRNA_spike_stan_data$size_y))
+rec_nomRNA_spike <- bp_sp_model_fits(bp_rec_nomRNA_spike, IgG_Spike_recovered_nomRNA_data, sp_rec_nomRNA_spike, sp_IgG_Spike_recovered_nomRNA_data)
+rec_nomRNA_rbd <- bp_sp_model_fits(bp_rec_nomRNA_rbd, IgG_RBD_recovered_nomRNA_data, sp_rec_nomRNA_rbd, sp_IgG_RBD_recovered_nomRNA_data)
 
-random_id <- sample(unique(covid_recovered$Record.ID), 1)
+rec_none_spike <- bp_sp_model_fits(bp_rec_none_spike, IgG_Spike_covid_recovered_data, sp_rec_none_spike, sp_IgG_Spike_covid_recovered_data)
+rec_none_rbd <- bp_sp_model_fits(bp_rec_none_rbd, IgG_RBD_covid_recovered_data, sp_rec_none_rbd, sp_IgG_RBD_covid_recovered_data)
+
+(naive_mRNA_spike + theme(legend.position = "none") + 
+    rec_mRNA_spike + theme(legend.position = "none")) / (naive_nomRNA_spike + theme(legend.position = "none") + rec_nomRNA_spike) / (rec_none_spike + theme(legend.position = "none") + plot_spacer()) + plot_annotation(tag_levels = 'A', tag_suffix = ')') & 
+  theme(plot.tag = element_text(size = 25))
+ggsave(here(paste0("results/paper_plots_revised/spike_all_model_fits.png")), height = 20, width = 27, dpi = 300)
+ggsave(here(paste0("results/paper_plots_revised/spike_all_model_fits.pdf")), height = 20, width = 27, dpi = 300)
+
+(naive_mRNA_rbd + theme(legend.position = "none") + 
+    rec_mRNA_rbd + theme(legend.position = "none")) / (naive_nomRNA_rbd + theme(legend.position = "none") + rec_nomRNA_rbd) / (rec_none_rbd + theme(legend.position = "none") + plot_spacer()) + plot_annotation(tag_levels = 'A', tag_suffix = ')') & 
+  theme(plot.tag = element_text(size = 25))
+ggsave(here(paste0("results/paper_plots_revised/rbd_all_model_fits.png")), height = 20, width = 27, dpi = 300)
+ggsave(here(paste0("results/paper_plots_revised/rbd_all_model_fits.pdf")), height = 20, width = 27, dpi = 300)
+```
 
 
-ggplot() + geom_point(data = stan_input %>% filter(ID == random_id), aes(x = time, y = y, colour = "Observed data"), size = 3) +
-  geom_ribbon(data = biphasic_plot_data %>% filter(ID == random_id), aes(x = days, ymin = X2.5., ymax = X97.5., fill = "95% posterior\npredictive interval"), alpha = 0.2) +
-  geom_line(data = biphasic_plot_data %>% filter(ID == random_id), aes(x = days, y = medians, colour = "Posterior\npredictive median"), linetype = "dashed", size = 1) +
-  geom_ribbon(data = single_plot_data %>% filter(ID == random_id), aes(x = days, ymin = X2.5., ymax = X97.5., group = group, fill = "95% posterior\npredictive interval"), alpha = 0.2) +
-  geom_line(data = single_plot_data %>% filter(ID == random_id), aes(x = days, y = medians, group = group, colour = "Posterior\npredictive median"), linetype = "dashed", size = 1) +
-  facet_wrap(ID ~ ., scales = "fixed", ncol = 4) + ylab("Adjusted MFI") + xlab("Time since first exposure (days)") + scale_colour_manual(values = c("darkgrey", "darkgrey", "black", "black")) + theme(axis.text=element_text(size=20), axis.title=element_text(size=20), strip.text = element_text(size = 20), legend.text=element_text(size=20), plot.title = element_text(size=22), legend.title=element_blank(), panel.grid.major = element_blank(), panel.grid.minor = element_blank()) + facet_grid(ID ~ Model) + scale_colour_manual(values = c("Observed data" = "black", "Posterior\npredictive median" = "black")) + scale_fill_manual(values = c("95% posterior\npredictive interval" = "blue"))
+Plot model fits for BP model.
+```{r}
+bp_model_fits <- function(stan_file, stan_data) {
+  stan_results <- get(stan_file)
+  pis <- predictive_interval(stan_results$y_rep, prob = 0.95)
+  yrep_pis <- cbind(pis, medians = colMedians(stan_results$y_rep))
+  
+  ids <- rep(stan_data$ids, each=stan_data$Nyt)
+  plot_data <- as.data.frame(yrep_pis) %>% mutate(days = rep(stan_data$yrep_times, stan_data$K), ID = ids)
+  plot_data <- as.data.frame(lapply(plot_data, unlist))
+  stan_input <- tibble(y = stan_data$y, time = stan_data$time, ID = rep(stan_data$ids, stan_data$size_y))
+  
+  plot_data <- plot_data %>% group_by(ID) %>% inner_join(stan_input %>% group_by(ID) %>% summarise(max_time = max(time)), by="ID") %>%   filter(days < max_time+10)
+  
+  
+  ggplot() + 
+    geom_ribbon(data = plot_data, 
+                aes(x = days, 
+                    ymin = X2.5., 
+                    ymax = X97.5., 
+                    colour = "95% posterior\npredictive interval"), 
+                alpha = 0.5) + 
+    geom_point(data = stan_input, 
+               aes(x = time, y = y, colour = "Observed data")) + 
+    geom_line(data = plot_data, aes(x = days, y = medians, colour = "Posterior predictive\nmedian")) + 
+  facet_wrap(ID ~ ., scales = "free_x", ncol = 4) + 
+    ylab("Adjusted MFI") + 
+    xlab("Time since first exposure (days)") + 
+    scale_colour_manual(values = c("darkgrey", "black", "black")) + 
+    theme_bw() + 
+    theme(axis.text=element_text(size=25), axis.title=element_text(size=25), strip.text = element_text(size = 25), legend.text=element_text(size=25), plot.title = element_text(size=27), legend.title=element_blank(), panel.grid.major = element_blank(), panel.grid.minor = element_blank())
+  
+  ggsave(here(paste0("results/paper_plots_revised/", stan_file, "_model_fits.png")), height = 30, width = 20, dpi = 300)
+  ggsave(here(paste0("results/paper_plots_revised/", stan_file, "_model_fits.pdf")), height = 30, width = 20, dpi = 300)
+}
+
+bp_model_fits("bp_rec_none_spike", IgG_Spike_covid_recovered_data)
+
+```
 
 
-# ggsave(here("results/paper_plots/rec_none_both_model_fits.png"), height = 10, width = 20, dpi = 300)
+Plot pooled model fits.
+```{r}
+model_fit_data <- function(stan_file, stan_data) {
+  stan_results <- get(stan_file)
+  pis <- predictive_interval(stan_results$y_rep, prob = 0.95)
+  yrep_pis <- cbind(pis, medians = colMedians(stan_results$y_rep))
+  
+  ids <- rep(stan_data$ids, each=stan_data$Nyt)
+  plot_data <- as.data.frame(yrep_pis) %>% mutate(days = rep(stan_data$yrep_times, stan_data$K), ID = ids)
+  plot_data <- as.data.frame(lapply(plot_data, unlist))
+  stan_input <- tibble(y = stan_data$y, time = stan_data$time, ID = rep(stan_data$ids, stan_data$size_y))
+  
+  plot_data <- plot_data %>% group_by(ID) %>% inner_join(stan_input %>% group_by(ID) %>% summarise(max_time = max(time)), by="ID") %>%   filter(days < max_time+10)
+  return(list(plot_data, stan_input))
+}
 
+naive_mRNA_spike_pd <- model_fit_data("bp_naive_mRNA_spike", IgG_Spike_naive_mRNA_data)
+naive_mRNA_rbd_pd <- model_fit_data("bp_naive_mRNA_rbd", IgG_RBD_naive_mRNA_data)
+
+naive_nomRNA_spike_pd <- model_fit_data("bp_naive_nomRNA_spike", IgG_Spike_naive_nomRNA_data)
+naive_nomRNA_rbd_pd <- model_fit_data("bp_naive_nomRNA_rbd", IgG_RBD_naive_nomRNA_data)
+
+rec_mRNA_spike_pd <- model_fit_data("bp_rec_mRNA_spike", IgG_Spike_recovered_mRNA_data)
+rec_mRNA_rbd_pd <- model_fit_data("bp_rec_mRNA_rbd", IgG_RBD_recovered_mRNA_data)
+
+rec_nomRNA_spike_pd <- model_fit_data("bp_rec_nomRNA_spike", IgG_Spike_recovered_nomRNA_data)
+rec_nomRNA_rbd_pd <- model_fit_data("bp_rec_nomRNA_rbd", IgG_RBD_recovered_nomRNA_data)
+
+rec_none_spike_pd <- model_fit_data("bp_rec_none_spike", IgG_Spike_covid_recovered_data)
+rec_none_rbd_pd <- model_fit_data("bp_rec_none_rbd", IgG_RBD_covid_recovered_data)
+
+spike_stan_output <- rbind(naive_mRNA_spike_pd[[1]] %>% mutate(Cohort = "Naive", Vaccine = "mRNA"),
+                     naive_nomRNA_spike_pd[[1]] %>% mutate(Cohort = "Naive", Vaccine = "non-mRNA"),
+                     rec_mRNA_spike_pd[[1]] %>% mutate(Cohort = "Recovered", Vaccine = "mRNA"),
+                     rec_nomRNA_spike_pd[[1]] %>% mutate(Cohort = "Recovered", Vaccine = "non-mRNA"),
+                     rec_none_spike_pd[[1]] %>% mutate(Cohort = "Recovered", Vaccine = "None"))
+
+spike_stan_input <- rbind(naive_mRNA_spike_pd[[2]] %>% mutate(Cohort = "Naive", Vaccine = "mRNA"),
+                     naive_nomRNA_spike_pd[[2]] %>% mutate(Cohort = "Naive", Vaccine = "non-mRNA"),
+                     rec_mRNA_spike_pd[[2]] %>% mutate(Cohort = "Recovered", Vaccine = "mRNA"),
+                     rec_nomRNA_spike_pd[[2]] %>% mutate(Cohort = "Recovered", Vaccine = "non-mRNA"),
+                     rec_none_spike_pd[[2]] %>% mutate(Cohort = "Recovered", Vaccine = "None"))
+
+rbd_stan_output <- rbind(naive_mRNA_rbd_pd[[1]] %>% mutate(Cohort = "Naive", Vaccine = "mRNA"),
+                     naive_nomRNA_rbd_pd[[1]] %>% mutate(Cohort = "Naive", Vaccine = "non-mRNA"),
+                     rec_mRNA_rbd_pd[[1]] %>% mutate(Cohort = "Recovered", Vaccine = "mRNA"),
+                     rec_nomRNA_rbd_pd[[1]] %>% mutate(Cohort = "Recovered", Vaccine = "non-mRNA"),
+                     rec_none_rbd_pd[[1]] %>% mutate(Cohort = "Recovered", Vaccine = "None"))
+
+rbd_stan_input <- rbind(naive_mRNA_rbd_pd[[2]] %>% mutate(Cohort = "Naive", Vaccine = "mRNA"),
+                     naive_nomRNA_rbd_pd[[2]] %>% mutate(Cohort = "Naive", Vaccine = "non-mRNA"),
+                     rec_mRNA_rbd_pd[[2]] %>% mutate(Cohort = "Recovered", Vaccine = "mRNA"),
+                     rec_nomRNA_rbd_pd[[2]] %>% mutate(Cohort = "Recovered", Vaccine = "non-mRNA"),
+                     rec_none_rbd_pd[[2]] %>% mutate(Cohort = "Recovered", Vaccine = "None"))
+
+ggplot() + 
+  geom_line(data = spike_stan_output, aes(x = days, y = medians, group = ID, colour = "Posterior predictive\nmedian")) +
+  geom_ribbon(data = spike_stan_output, aes(ymin = X2.5., ymax = X97.5., x = days, group = ID, fill = "95% posterior\npredictive interval"), alpha = 0.08) + 
+  geom_point(data = spike_stan_input, aes(x = time, y = y, colour = "Observed data")) +
+  facet_grid2(Vaccine ~ Cohort, render_empty = FALSE) +
+  scale_colour_manual(values = c("black", "black")) + 
+  scale_fill_manual(values = c("darkgrey")) + 
+  theme_bw() +
+  theme(axis.text=element_text(size=25), axis.title=element_text(size=25), strip.text = element_text(size = 25), legend.text=element_text(size=25), plot.title = element_text(size=27), legend.title=element_blank(), panel.grid.major = element_blank(), panel.grid.minor = element_blank()) +
+  xlab("Time (days)") +
+  ylab("Adjusted MFI")
+ggsave(here(paste0("results/paper_plots_revised/spike_pooled_model_fits.png")), height = 15, width = 20, dpi = 300)
+ggsave(here(paste0("results/paper_plots_revised/spike_pooled_model_fits.pdf")), height = 15, width = 20, dpi = 300)
+
+
+ggplot() + 
+  geom_line(data = rbd_stan_output, aes(x = days, y = medians, group = ID, colour = "Posterior predictive\nmedian")) +
+  geom_ribbon(data = rbd_stan_output, aes(ymin = X2.5., ymax = X97.5., x = days, group = ID, fill = "95% posterior\npredictive interval"), alpha = 0.08) + 
+  geom_point(data = rbd_stan_input, aes(x = time, y = y, colour = "Observed data")) +
+  facet_grid2(Vaccine ~ Cohort, render_empty = FALSE) +
+  scale_colour_manual(values = c("black", "black")) + 
+  scale_fill_manual(values = c("darkgrey")) + 
+  theme_bw() +
+  theme(axis.text=element_text(size=25), axis.title=element_text(size=25), strip.text = element_text(size = 25), legend.text=element_text(size=25), plot.title = element_text(size=27), legend.title=element_blank(), panel.grid.major = element_blank(), panel.grid.minor = element_blank()) +
+  xlab("Time (days)") +
+  ylab("Adjusted MFI")
+ggsave(here(paste0("results/paper_plots_revised/rbd_pooled_model_fits.png")), height = 15, width = 20, dpi = 300)
+ggsave(here(paste0("results/paper_plots_revised/rbd_pooled_model_fits.pdf")), height = 15, width = 20, dpi = 300)
+```
+
+
+
+Correlation plots for LLPC half-life and m for exposures times and age.
+```{r}
+llpc_corr_plot_data <- rbind(tibble(d_l = colMedians(bp_naive_mRNA_rbd$d_l), 
+                                    total_exposure = IgG_RBD_naive_mRNA_data$time[cumsum(IgG_RBD_naive_mRNA_data$size_T)], 
+                                    no_exposure = IgG_RBD_naive_mRNA_data$size_bt,
+                                    median_interval = tibble(exposures = IgG_RBD_naive_mRNA_data$taus, 
+                                                             id = rep(IgG_RBD_naive_mRNA_data$id, times=IgG_RBD_naive_mRNA_data$size_bt)) %>% 
+                                      group_by(id) %>% 
+                                      mutate(time_diff = exposures - first(exposures)) %>% 
+                                      summarise(median_interval = median(time_diff)) %>% arrange(match(id, IgG_RBD_naive_mRNA_data$ids)) %>% 
+                                      pull(median_interval),
+                                    age = covid_naive %>% 
+                                      filter(Record.ID %in% IgG_RBD_naive_mRNA_data$ids) %>% 
+                                      distinct(Record.ID, Age..Baseline.Visit..A..) %>% 
+                                      arrange(match(Record.ID, IgG_RBD_naive_mRNA_data$ids)) %>% 
+                                      pull(Age..Baseline.Visit..A..)) %>% 
+                               mutate(Vaccine = "mRNA", Cohort = "Naive", antigen = "RBD", id = IgG_RBD_naive_mRNA_data$ids),
+      tibble(d_l = colMedians(bp_naive_nomRNA_rbd$d_l), 
+                                    total_exposure = IgG_RBD_naive_nomRNA_data$time[cumsum(IgG_RBD_naive_nomRNA_data$size_T)], 
+                                    no_exposure = IgG_RBD_naive_nomRNA_data$size_bt,
+             median_interval = tibble(exposures = IgG_RBD_naive_nomRNA_data$taus, 
+                                                             id = rep(IgG_RBD_naive_nomRNA_data$id, times=IgG_RBD_naive_nomRNA_data$size_bt)) %>% 
+                                      group_by(id) %>% 
+                                      mutate(time_diff = exposures - first(exposures)) %>% 
+                                      summarise(median_interval = median(time_diff)) %>% arrange(match(id, IgG_RBD_naive_nomRNA_data$ids)) %>% 
+                                      pull(median_interval),
+                                    age = covid_naive %>% 
+                                      filter(Record.ID %in% IgG_RBD_naive_nomRNA_data$ids) %>% 
+                                      distinct(Record.ID, Age..Baseline.Visit..A..) %>% 
+                                      arrange(match(Record.ID, IgG_RBD_naive_nomRNA_data$ids)) %>% 
+                                      pull(Age..Baseline.Visit..A..)) %>% 
+        mutate(Vaccine = "non-mRNA", Cohort = "Naive", antigen = "RBD", id = IgG_RBD_naive_nomRNA_data$ids),
+      tibble(d_l = colMedians(bp_rec_mRNA_rbd$d_l),
+             total_exposure = IgG_RBD_recovered_mRNA_data$time[cumsum(IgG_RBD_recovered_mRNA_data$size_T)], 
+             no_exposure = IgG_RBD_recovered_mRNA_data$size_bt,
+             median_interval = tibble(exposures = IgG_RBD_recovered_mRNA_data$taus, 
+                                                             id = rep(IgG_RBD_recovered_mRNA_data$id, times=IgG_RBD_recovered_mRNA_data$size_bt)) %>% 
+                                      group_by(id) %>% 
+                                      filter(row_number() != 1) %>%
+                                      mutate(time_diff = exposures - first(exposures)) %>% 
+                                      summarise(median_interval = median(time_diff)) %>% arrange(match(id, IgG_RBD_recovered_mRNA_data$ids)) %>% 
+                                      pull(median_interval),
+                                    age = covid_recovered %>% 
+                                      filter(Record.ID %in% IgG_RBD_recovered_mRNA_data$ids) %>% 
+                                      distinct(Record.ID, Age..Baseline.Visit..A..) %>% 
+                                      arrange(match(Record.ID, IgG_RBD_recovered_mRNA_data$ids)) %>% 
+                                      pull(Age..Baseline.Visit..A..)) %>% 
+        mutate(Vaccine = "mRNA", Cohort = "Recovered", antigen = "RBD", id = IgG_RBD_recovered_mRNA_data$ids),
+      tibble(d_l = colMedians(bp_rec_nomRNA_rbd$d_l),
+             total_exposure = IgG_RBD_recovered_nomRNA_data$time[cumsum(IgG_RBD_recovered_nomRNA_data$size_T)], 
+             no_exposure = IgG_RBD_recovered_nomRNA_data$size_bt,
+             median_interval = tibble(exposures = IgG_RBD_recovered_nomRNA_data$taus, 
+                                                             id = rep(IgG_RBD_recovered_nomRNA_data$id, times=IgG_RBD_recovered_nomRNA_data$size_bt)) %>% 
+                                      group_by(id) %>% 
+                                      filter(row_number() != 1) %>%
+                                      mutate(time_diff = exposures - first(exposures)) %>% 
+                                      summarise(median_interval = median(time_diff)) %>% arrange(match(id, IgG_RBD_recovered_nomRNA_data$ids)) %>% 
+                                      pull(median_interval),
+                                    age = covid_recovered %>% 
+                                      filter(Record.ID %in% IgG_RBD_recovered_nomRNA_data$ids) %>% 
+                                      distinct(Record.ID, Age..Baseline.Visit..A..) %>% 
+                                      arrange(match(Record.ID, IgG_RBD_recovered_nomRNA_data$ids)) %>% 
+                                      pull(Age..Baseline.Visit..A..)) %>% 
+        mutate(Vaccine = "non-mRNA", Cohort = "Recovered", antigen = "RBD", id = IgG_RBD_recovered_nomRNA_data$ids),
+      tibble(d_l = colMedians(bp_naive_mRNA_spike$d_l),
+             total_exposure = IgG_Spike_naive_mRNA_data$time[cumsum(IgG_Spike_naive_mRNA_data$size_T)], 
+             no_exposure = IgG_Spike_naive_mRNA_data$size_bt,
+             median_interval = tibble(exposures = IgG_Spike_naive_mRNA_data$taus, 
+                                                             id = rep(IgG_Spike_naive_mRNA_data$id, times=IgG_Spike_naive_mRNA_data$size_bt)) %>% 
+                                      group_by(id) %>% 
+                                      mutate(time_diff = exposures - first(exposures)) %>% 
+                                      summarise(median_interval = median(time_diff)) %>% arrange(match(id, IgG_Spike_naive_mRNA_data$ids)) %>% 
+                                      pull(median_interval),
+                                    age = covid_naive %>% 
+                                      filter(Record.ID %in% IgG_Spike_naive_mRNA_data$ids) %>% 
+                                      distinct(Record.ID, Age..Baseline.Visit..A..) %>% 
+                                      arrange(match(Record.ID, IgG_Spike_naive_mRNA_data$ids)) %>% 
+                                      pull(Age..Baseline.Visit..A..)) %>% 
+        mutate(Vaccine = "mRNA", Cohort = "Naive", antigen = "Spike", id = IgG_Spike_naive_mRNA_data$ids),
+      tibble(d_l = colMedians(bp_naive_nomRNA_spike$d_l),
+             total_exposure = IgG_Spike_naive_nomRNA_data$time[cumsum(IgG_Spike_naive_nomRNA_data$size_T)],
+             no_exposure = IgG_Spike_naive_nomRNA_data$size_bt,
+             median_interval = tibble(exposures = IgG_Spike_naive_nomRNA_data$taus, 
+                                                             id = rep(IgG_Spike_naive_nomRNA_data$id, times=IgG_Spike_naive_nomRNA_data$size_bt)) %>% 
+                                      group_by(id) %>% 
+                                      mutate(time_diff = exposures - first(exposures)) %>% 
+                                      summarise(median_interval = median(time_diff)) %>% arrange(match(id, IgG_Spike_naive_nomRNA_data$ids)) %>% 
+                                      pull(median_interval),
+                                    age = covid_naive %>% 
+                                      filter(Record.ID %in% IgG_Spike_naive_nomRNA_data$ids) %>% 
+                                      distinct(Record.ID, Age..Baseline.Visit..A..) %>% 
+                                      arrange(match(Record.ID, IgG_Spike_naive_nomRNA_data$ids)) %>% 
+                                      pull(Age..Baseline.Visit..A..)) %>% 
+        mutate(Vaccine = "non-mRNA", Cohort = "Naive", antigen = "Spike", id = IgG_Spike_naive_nomRNA_data$ids),
+      tibble(d_l = colMedians(bp_rec_mRNA_spike$d_l),
+             total_exposure = IgG_Spike_recovered_mRNA_data$time[cumsum(IgG_Spike_recovered_mRNA_data$size_T)], 
+             no_exposure = IgG_Spike_recovered_mRNA_data$size_bt,
+             median_interval = tibble(exposures = IgG_Spike_recovered_mRNA_data$taus, 
+                                                             id = rep(IgG_Spike_recovered_mRNA_data$id, times=IgG_Spike_recovered_mRNA_data$size_bt)) %>% 
+                                      group_by(id) %>% 
+                                      filter(row_number() != 1) %>%
+                                      mutate(time_diff = exposures - first(exposures)) %>% 
+                                      summarise(median_interval = median(time_diff)) %>% arrange(match(id, IgG_Spike_recovered_mRNA_data$ids)) %>% 
+                                      pull(median_interval),
+                                    age = covid_recovered %>% 
+                                      filter(Record.ID %in% IgG_Spike_recovered_mRNA_data$ids) %>% 
+                                      distinct(Record.ID, Age..Baseline.Visit..A..) %>% 
+                                      arrange(match(Record.ID, IgG_Spike_recovered_mRNA_data$ids)) %>% 
+                                      pull(Age..Baseline.Visit..A..)) %>% 
+        mutate(Vaccine = "mRNA", Cohort = "Recovered", antigen = "Spike", id = IgG_Spike_recovered_mRNA_data$ids),
+      tibble(d_l = colMedians(bp_rec_nomRNA_spike$d_l),
+             total_exposure = IgG_Spike_recovered_nomRNA_data$time[cumsum(IgG_Spike_recovered_nomRNA_data$size_T)], 
+             no_exposure = IgG_Spike_recovered_nomRNA_data$size_bt,
+             median_interval = tibble(exposures = IgG_Spike_recovered_nomRNA_data$taus, 
+                                                             id = rep(IgG_Spike_recovered_nomRNA_data$id, times=IgG_Spike_recovered_nomRNA_data$size_bt)) %>% 
+                                      group_by(id) %>% 
+                                      filter(row_number() != 1) %>%
+                                      mutate(time_diff = exposures - first(exposures)) %>% 
+                                      summarise(median_interval = median(time_diff)) %>% arrange(match(id, IgG_Spike_recovered_nomRNA_data$ids)) %>% 
+                                      pull(median_interval),
+                                    age = covid_recovered %>% 
+                                      filter(Record.ID %in% IgG_Spike_recovered_nomRNA_data$ids) %>% 
+                                      distinct(Record.ID, Age..Baseline.Visit..A..) %>% 
+                                      arrange(match(Record.ID, IgG_Spike_recovered_nomRNA_data$ids)) %>% 
+                                      pull(Age..Baseline.Visit..A..)) %>% 
+        mutate(Vaccine = "non-mRNA", Cohort = "Recovered", antigen = "Spike", id = IgG_Spike_recovered_nomRNA_data$ids))
+
+```
+
+```{r}
+m_corr_plot_data <- rbind(calculate_antibody_boosts(bp_naive_mRNA_rbd, IgG_RBD_naive_mRNA_data) %>% 
+                            mutate(day = IgG_RBD_naive_mRNA_data$taus, 
+                                   exposure_interval = tibble(exposures = IgG_RBD_naive_mRNA_data$taus, 
+                                                             id = rep(IgG_RBD_naive_mRNA_data$id, times=IgG_RBD_naive_mRNA_data$size_bt)) %>% 
+                                      group_by(id) %>% 
+                                      mutate(time_diff = exposures - first(exposures)) %>% 
+                                      arrange(match(id, IgG_RBD_naive_mRNA_data$ids)) %>%
+                                     pull(time_diff),
+                                   Vaccine = "mRNA", Cohort = "Naive", antigen = "RBD"),
+      calculate_antibody_boosts(bp_naive_nomRNA_rbd, IgG_RBD_naive_nomRNA_data) %>% 
+        mutate(day = IgG_RBD_naive_nomRNA_data$taus, 
+               exposure_interval = tibble(exposures = IgG_RBD_naive_nomRNA_data$taus, 
+                                                             id = rep(IgG_RBD_naive_nomRNA_data$id, times=IgG_RBD_naive_nomRNA_data$size_bt)) %>% 
+                                      group_by(id) %>% 
+                                      mutate(time_diff = exposures - first(exposures)) %>% 
+                                      arrange(match(id, IgG_RBD_naive_nomRNA_data$ids)) %>%
+                                     pull(time_diff),
+               Vaccine = "non-mRNA", Cohort = "Naive", antigen = "RBD"),
+      calculate_antibody_boosts(bp_rec_mRNA_rbd, IgG_RBD_recovered_mRNA_data) %>% 
+        mutate(day = IgG_RBD_recovered_mRNA_data$taus, 
+               exposure_interval = tibble(exposures = IgG_RBD_recovered_mRNA_data$taus, 
+                                                             id = rep(IgG_RBD_recovered_mRNA_data$id, times=IgG_RBD_recovered_mRNA_data$size_bt)) %>% 
+                                      group_by(id) %>% 
+                                      mutate(time_diff = exposures - nth(exposures, 2)) %>% 
+                                      arrange(match(id, IgG_RBD_recovered_mRNA_data$ids)) %>%
+                                     pull(time_diff),
+               Vaccine = "mRNA", Cohort = "Recovered", antigen = "RBD"),
+      calculate_antibody_boosts(bp_rec_nomRNA_rbd, IgG_RBD_recovered_nomRNA_data) %>% 
+        mutate(day = IgG_RBD_recovered_nomRNA_data$taus, 
+               exposure_interval = tibble(exposures = IgG_RBD_recovered_nomRNA_data$taus, 
+                                                             id = rep(IgG_RBD_recovered_nomRNA_data$id, times=IgG_RBD_recovered_nomRNA_data$size_bt)) %>% 
+                                      group_by(id) %>% 
+                                      mutate(time_diff = exposures - nth(exposures, 2)) %>% 
+                                      arrange(match(id, IgG_RBD_recovered_nomRNA_data$ids)) %>%
+                                     pull(time_diff),
+               Vaccine = "non-mRNA", Cohort = "Recovered", antigen = "RBD"),
+      calculate_antibody_boosts(bp_naive_mRNA_spike, IgG_Spike_naive_mRNA_data) %>% 
+        mutate(day = IgG_Spike_naive_mRNA_data$taus, 
+               exposure_interval = tibble(exposures = IgG_Spike_naive_mRNA_data$taus, 
+                                                             id = rep(IgG_Spike_naive_mRNA_data$id, times=IgG_Spike_naive_mRNA_data$size_bt)) %>% 
+                                      group_by(id) %>% 
+                                      mutate(time_diff = exposures - first(exposures)) %>% 
+                                      arrange(match(id, IgG_Spike_naive_mRNA_data$ids)) %>%
+                                     pull(time_diff),
+               Vaccine = "mRNA", Cohort = "Naive", antigen = "Spike"),
+      calculate_antibody_boosts(bp_naive_nomRNA_spike, IgG_Spike_naive_nomRNA_data) %>% 
+        mutate(day = IgG_Spike_naive_nomRNA_data$taus, 
+               exposure_interval = tibble(exposures = IgG_Spike_naive_nomRNA_data$taus, 
+                                                             id = rep(IgG_Spike_naive_nomRNA_data$id, times=IgG_Spike_naive_nomRNA_data$size_bt)) %>% 
+                                      group_by(id) %>% 
+                                      mutate(time_diff = exposures - first(exposures)) %>% 
+                                      arrange(match(id, IgG_Spike_naive_nomRNA_data$ids)) %>%
+                                     pull(time_diff),
+               Vaccine = "non-mRNA", Cohort = "Naive", antigen = "Spike"),
+      calculate_antibody_boosts(bp_rec_mRNA_spike, IgG_Spike_recovered_mRNA_data) %>% 
+        mutate(day = IgG_Spike_recovered_mRNA_data$taus, 
+               exposure_interval = tibble(exposures = IgG_Spike_recovered_mRNA_data$taus, 
+                                                             id = rep(IgG_Spike_recovered_mRNA_data$id, times=IgG_Spike_recovered_mRNA_data$size_bt)) %>% 
+                                      group_by(id) %>% 
+                                      mutate(time_diff = exposures - nth(exposures, 2)) %>% 
+                                      arrange(match(id, IgG_Spike_recovered_mRNA_data$ids)) %>%
+                                     pull(time_diff),
+               Vaccine = "mRNA", Cohort = "Recovered", antigen = "Spike"),
+      calculate_antibody_boosts(bp_rec_nomRNA_spike, IgG_Spike_recovered_nomRNA_data) %>% 
+        mutate(day = IgG_Spike_recovered_nomRNA_data$taus, 
+               exposure_interval = tibble(exposures = IgG_Spike_recovered_nomRNA_data$taus, 
+                                                             id = rep(IgG_Spike_recovered_nomRNA_data$id, times=IgG_Spike_recovered_nomRNA_data$size_bt)) %>% 
+                                      group_by(id) %>% 
+                                      mutate(time_diff = exposures - nth(exposures, 2)) %>% 
+                                      arrange(match(id, IgG_Spike_recovered_nomRNA_data$ids)) %>%
+                                     pull(time_diff),
+               Vaccine = "non-mRNA", Cohort = "Recovered", antigen = "Spike"))
+
+full_plot_data <- full_join(llpc_corr_plot_data, m_corr_plot_data, by=c("id", "Vaccine", "Cohort", "antigen"))
 ```
 
 
 ```{r}
-biphasic_model_results <- rstan::extract(IgG_RBD_rec_none_all)
-single_model_results <- rstan::extract(miceadds::load.Rdata2(filename = "IgG_RBD_rec_none.Rdata", path=here("results/simple_decay_fits/")))
-single_model_data <- miceadds::load.Rdata2(filename = "IgG_RBD_rec_none_data.Rdata", path=here("results/simple_decay_fits/"))
+llpcs_age <- ggplot() + geom_point(data = llpc_corr_plot_data, aes(x = age, y = d_l, colour = Cohort, shape = Vaccine), size = 4) +
+  theme_bw() +
+  ylab("Median estimate of LLPC half-life (days)") +
+  xlab("Age (years)") +
+  theme(axis.text=element_text(size=22), axis.title=element_text(size=22), strip.text = element_text(size = 22), legend.text=element_text(size=22), plot.title = element_text(size=24), legend.title=element_text(size=22), panel.grid.major = element_blank(), panel.grid.minor = element_blank(), legend.position="none") + facet_wrap(antigen ~ .)
 
-single_pis <- predictive_interval(as.matrix(miceadds::load.Rdata2(filename = "IgG_RBD_rec_none.Rdata", path=here("results/simple_decay_fits/"))), prob = 0.95)
-single_indexes <- grepl("^y_rep[[0-9]+\\]$", row.names(single_pis))
-single_yrep_pis <- single_pis[single_indexes, ]
-single_yrep_pis <- cbind(single_yrep_pis, medians = colMedians(single_model_results$y_rep))
+m_age <- ggplot() + geom_point(data = full_plot_data, aes(x = age, y = median_boost, colour = Cohort, shape = Vaccine), size = 4) +
+  theme_bw() +
+  ylab("Median estimate of antibody increase per exposure (adjusted MFI)") +
+  xlab("Age (years)") +
+  theme(axis.text=element_text(size=22), axis.title=element_text(size=22), strip.text = element_text(size = 22), legend.text=element_text(size=22), plot.title = element_text(size=24), legend.title=element_text(size=22), panel.grid.major = element_blank(), panel.grid.minor = element_blank()) + facet_wrap(antigen ~ .)
 
-single_id_size <- c()
-# filtered_ids <- unique(covid_recovered_mRNA$Record.ID)[which(single_model_data$og_segments != 0)]
-filtered_ids <- unique(covid_recovered$Record.ID)[which(single_model_data$no_segments != 0)]
-pos <- 1
-for (i in 1:length(single_model_data$no_segments)) {
-  size <- 0
-  for (j in 1:single_model_data$no_segments[i]) {
-    size <- size + single_model_data$size_segments[pos]
-    pos <- pos + 1
-  }
-  single_id_size <- c(single_id_size, size)
-}
+llpcs_age + m_age + plot_annotation(tag_levels = 'A', tag_suffix = ')') & 
+  theme(plot.tag = element_text(size = 22))
 
-single_ids <- rep(filtered_ids, single_id_size)
-single_plot_data <- as.data.frame(single_yrep_pis) %>% mutate(days = single_model_data$og_times, ID = single_ids)
-single_plot_data <- as.data.frame(lapply(single_plot_data, unlist)) %>% mutate(Model = "Single decay model fit") %>% group_by(ID) %>% mutate(group = cumsum(lag(medians, default = first(medians)) < medians) + 1)
-
-idx <- which(inf_ids == "LVCC-0014")
-plot_times <- seq(0, max(inf_results[[idx]]$no_reinf_t), length.out=50)
-
-multis <- biphasic_model_results$multiplier[,(sum((size_new_tau-1)[1:idx-1])+1):((sum((size_new_tau-1)[1:idx-1])+1)+(size_new_tau-1)[idx]-1)]
+ggsave(here("results/paper_plots_revised/llpc_m_age_plots.pdf"), width = 18, height = 10, dpi = 300)
+ggsave(here("results/paper_plots_revised/llpc_m_age_plots.png"), width = 18, height = 10, dpi = 300)
 
 
-generated_quantities <- tibble()
-for (i in 1:length(biphasic_model_results$rate)) {
-  y_reps <- michaels_antibody_model_noise(plot_times, 0, biphasic_model_results$beta[i,idx], biphasic_model_results$rho[i,idx], biphasic_model_results$d_a[i,idx], biphasic_model_results$d_l[i,idx], biphasic_model_results$d_s[i,idx], 1, biphasic_model_results$rate[i])
-  generated_quantities <- rbind(generated_quantities, tibble(plot_times, y_reps))
-  print(i)
-}
+llpc_interval <- ggplot() + geom_point(data = llpc_corr_plot_data, aes(x = median_interval, y = d_l, colour = Cohort, shape = Vaccine), size = 4) +
+  theme_bw() +
+  ylab("Median estimate of LLPC half-life (days)") +
+  xlab("Median time between vaccinations (days)") +
+  theme(axis.text=element_text(size=22), axis.title=element_text(size=22), strip.text = element_text(size = 22), legend.text=element_text(size=22), plot.title = element_text(size=24), legend.title=element_text(size=22), panel.grid.major = element_blank(), panel.grid.minor = element_blank(), legend.position="none") + scale_x_continuous(breaks = seq(0, 249, by = 50)) + facet_wrap(antigen ~ .)
 
-plot_data <- generated_quantities %>% group_by(plot_times) %>% reframe(medians = median(y_reps), pi_min = predictive_interval(as.matrix(y_reps), prob = 0.95)[,1], pi_max = predictive_interval(as.matrix(y_reps), prob = 0.95)[,2]) %>% mutate(Model = "Bi-phasic decay model fit", ID = inf_ids[idx])
+m_interval <- ggplot() + geom_point(data = m_corr_plot_data %>% filter(exposure_interval >= 0), aes(x = exposure_interval, y = median_boost, colour = Cohort, shape = Vaccine), size = 4) +
+  theme_bw() +
+  ylab("Median estimate of antibody increase per exposure (adjusted MFI)") +
+  xlab("Time between vaccinations (days)") +
+  theme(axis.text=element_text(size=22), axis.title=element_text(size=22), strip.text = element_text(size = 22), legend.text=element_text(size=22), plot.title = element_text(size=24), legend.title=element_text(size=22), panel.grid.major = element_blank(), panel.grid.minor = element_blank()) + facet_wrap(antigen ~ .)
 
-# obs_data <- tibble(time = inf_results[[idx]]$no_reinf_t, ab = inf_results[[idx]]$no_reinf_y, ID = "LVCC-0014")
-obs_data <- tibble(time = inf_results[[idx]]$prior_inf_time, ab = inf_results[[idx]]$prior_inf_ab, ID = "LVCC-0014")
+llpc_interval + m_interval + plot_annotation(tag_levels = 'A', tag_suffix = ')') & 
+  theme(plot.tag = element_text(size = 22))
 
-ggplot() + geom_point(data = obs_data, aes(x = time, y = ab, colour = "Observed data"), size = 3) +
-  geom_ribbon(data = plot_data, aes(x = plot_times, ymin = pi_min, ymax = pi_max, fill = "95% posterior\npredictive interval"), alpha = 0.2) +
-  geom_ribbon(data = single_plot_data %>% filter(ID == inf_ids[idx]), aes(x = days, ymin = X2.5., ymax = X97.5., group = group, fill = "95% posterior\npredictive interval"), alpha = 0.2) +
-  geom_line(data = single_plot_data %>% filter(ID == inf_ids[idx]), aes(x = days, y = medians, group = group, colour = "Posterior\npredictive median"), linetype = "dashed", size = 1) +
-  geom_line(data = plot_data, aes(x = plot_times, y = medians, colour = "Posterior\npredictive median"), linetype = "dashed", size = 1) + ylab("Adjusted MFI") + xlab("Time since first exposure (days)") + scale_colour_manual(values = c("darkgrey", "darkgrey", "black", "black")) + theme(axis.text=element_text(size=20), axis.title=element_text(size=20), strip.text = element_text(size = 20), legend.text=element_text(size=20), plot.title = element_text(size=22), legend.title=element_blank(), panel.grid.major = element_blank(), panel.grid.minor = element_blank()) + scale_colour_manual(values = c("Observed data" = "black", "Posterior\npredictive median" = "black")) + scale_fill_manual(values = c("95% posterior\npredictive interval" = "blue")) + facet_grid(ID ~ Model)
+ggsave(here("results/paper_plots_revised/llpc_m_interval_plots.pdf"), width = 18, height = 10, dpi = 300)
+ggsave(here("results/paper_plots_revised/llpc_m_interval_plots.png"), width = 18, height = 10, dpi = 300)
 
-ggsave(here("results/paper_plots/LVCC-0014_model_fit_RBD.png"), height = 10, width = 20, dpi = 300)
+
+
+llpcs_num_exp <- ggplot() + geom_point(data = llpc_corr_plot_data, aes(x = no_exposure, y = d_l, colour = Cohort, shape = Vaccine), size = 4) +
+  theme_bw() +
+  ylab("Median estimate of LLPC half-life (days)") +
+  xlab("Number of exposures") +
+  theme(axis.text=element_text(size=22), axis.title=element_text(size=22), strip.text = element_text(size = 22), legend.text=element_text(size=22), plot.title = element_text(size=24), legend.title=element_text(size=22), panel.grid.major = element_blank(), panel.grid.minor = element_blank(), legend.position="none") + facet_wrap(antigen ~ .)
+
+m_num_exp <- ggplot() + geom_point(data = m_corr_plot_data, aes(x = exposure, y = median_boost, colour = Cohort, shape = Vaccine), size = 4) +
+  theme_bw() +
+  ylab("Median estimate of antibody increase per exposure (adjusted MFI)") +
+  xlab("Number of exposures") +
+  theme(axis.text=element_text(size=22), axis.title=element_text(size=22), strip.text = element_text(size = 22), legend.text=element_text(size=22), plot.title = element_text(size=24), legend.title=element_text(size=22), panel.grid.major = element_blank(), panel.grid.minor = element_blank()) + facet_wrap(antigen ~ .)
+
+llpcs_num_exp + m_num_exp + plot_annotation(tag_levels = 'A', tag_suffix = ')') & 
+  theme(plot.tag = element_text(size = 22))
+
+ggsave(here("results/paper_plots_revised/llpc_m_num_exp_plots.pdf"), width = 18, height = 10, dpi = 300)
+ggsave(here("results/paper_plots_revised/llpc_m_num_exp_plots.png"), width = 18, height = 10, dpi = 300)
 ```
 
 
+
+
+Model comparison with Bayes Factor.
 ```{r}
-# Median time from natural infection to first vaccination (take a couple of weeks)
-covid_recovered %>% group_by(Record.ID) %>% filter(IgClass %in% c("IgG", NA), Event.Name == "V1") %>% ungroup() %>% summarise(median(days))
+loo_1 <- loo(IgG_Spike_naive_mRNA, save_psis = TRUE, moment_match = TRUE, cores = detectCores()/2)
+loo_2 <- loo(two_beta_fit, save_psis = TRUE, moment_match = TRUE, cores = detectCores()/2)
+# loo_1 <- loo(one_beta_fit)
+# loo_2 <- loo(two_beta_fit)
+loo_1 <- loo_moment_match(fit, loo(fit))
 
-# Median time between first and second mRNA vaccination
-covid_naive_mRNA %>% group_by(Record.ID) %>% filter(IgClass %in% c("IgG", NA), Event.Name %in% c("V1", "V2")) %>% summarise(diff = diff(days)) %>% ungroup() %>% summarise(median(diff))
-covid_recovered_mRNA %>% group_by(Record.ID) %>% filter(IgClass %in% c("IgG", NA), Event.Name %in% c("V1", "V2")) %>% summarise(diff = diff(days)) %>% ungroup() %>% summarise(median(diff))
+loo_compare(loo_1, loo_2)
 
-# Median time between first and second non-mRNA vaccination
-covid_naive_nomRNA %>% group_by(Record.ID) %>% filter(IgClass %in% c("IgG", NA), Event.Name %in% c("V1", "V2")) %>% summarise(diff = diff(days)) %>% ungroup() %>% summarise(median(diff))
-covid_recovered_nomRNA %>% group_by(Record.ID) %>% filter(IgClass %in% c("IgG", NA), Event.Name %in% c("V1", "V2")) %>% summarise(diff = diff(days)) %>% ungroup() %>% summarise(median(diff))
+ppc_loo_pit_overlay(stan_data$y, rstan::extract(one_beta_fit)$y_rep, loo_1$psis_object$log_weights)
 
-# Median time between second and booster mRNA vaccination
-covid_naive_mRNA %>% group_by(Record.ID) %>% filter(IgClass %in% c("IgG", NA), Event.Name %in% c("V2", "B1")) %>% summarise(diff = diff(days)) %>% ungroup() %>% summarise(median(diff))
-covid_recovered_mRNA %>% group_by(Record.ID) %>% filter(IgClass %in% c("IgG", NA), Event.Name %in% c("V2", "B1")) %>% summarise(diff = diff(days)) %>% ungroup() %>% summarise(median(diff))
 
-# Median time between second and booster non-mRNA vaccination
-covid_naive_nomRNA %>% group_by(Record.ID) %>% filter(IgClass %in% c("IgG", NA), Event.Name %in% c("V2", "B1")) %>% summarise(diff = diff(days)) %>% ungroup() %>% summarise(median(diff))
-covid_recovered_nomRNA %>% group_by(Record.ID) %>% filter(IgClass %in% c("IgG", NA), Event.Name %in% c("V2", "B1")) %>% summarise(diff = diff(days)) %>% ungroup() %>% summarise(median(diff))
+which(pareto_k_values(loo_1) > 0.7)
+which(pareto_k_values(loo_2) > 0.7)
+all_y[which(pareto_k_values > 0.7)]
+
+
+sp_stan_obj <- stan(
+      file = here("stan_scripts/COVID_monophasic_model.stan"),
+      data = sp_IgG_Spike_recovered_mRNA_data,
+      chains = 0 # Set chains to 0 to not sample
+    )
+
+bp_stan_obj <- stan(
+      file = here("stan_scripts/COVID_biphasic_model.stan"),
+      data = IgG_Spike_recovered_mRNA_data,
+      chains = 0 # Set chains to 0 to not sample
+    )
+
+# Calculate marginal likelihoods
+bridge1 <- bridge_sampler(samples = IgG_Spike_recovered_mRNA, stanfit_model = bp_stan_obj)
+bridge2 <- bridge_sampler(samples = sp_IgG_Spike_recovered_mRNA, stanfit_model = sp_stan_obj)
+bayes_factor(bridge1, bridge2)
+
 ```
+
+
+
+
+
+
+
 
 
 

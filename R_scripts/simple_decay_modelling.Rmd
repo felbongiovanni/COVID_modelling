@@ -6,44 +6,43 @@ output: html_document
 ```{r, include=FALSE}
 library(rstan)
 options(mc.cores = parallel::detectCores())
-rstan_options(auto_write = TRUE)
+rstan_options(auto_write = TRUE, threads_per_chain = 1)
 library(ggplot2)
-library(tidybayes)
-library(ggpubr)
+# library(tidybayes)
+# library(ggpubr)
 library(here)
 library(dplyr)
 library(readxl)
-library(rstanarm)
+# library(rstanarm)
 library(reshape2)
 library(lubridate)
 library(stringr)
 library(tidyr)
 library(pbmcapply)
-library(tidyverse)
-library(bayesplot)
-library(BayesTools)
-library(caret)
-library(xgboost)
-library(loo)
-library(brms)
+# library(tidyverse)
+# library(bayesplot)
+# library(BayesTools)
+# library(caret)
+# library(brms)
 library(ggh4x)
-library(truncnorm)
-library(HDInterval)
 library(bayestestR)
+# library(matrixStats)
 ```
 
-```{r}
-source(here("functions.R"))
 
-IgG_data <- read_excel(here("data/COVID_profile/CP_AdjMFI_IgG_Dec2023_FINAL.xlsx")) %>% mutate(code = str_extract(SampleID, "[^-]+$"), IgClass = "IgG")
-IgM_data <- read_excel(here("data/COVID_profile/CP_AdjMFI_IgM_Dec2023_FINAL.xlsx")) %>% mutate(code = str_extract(SampleID, "[^-]+$"), IgClass = "IgM")
-IgA_data <- read_excel(here("data/COVID_profile/CP_AdjMFI_IgA_Dec2023_FINAL.xlsx")) %>% mutate(code = str_extract(SampleID, "[^-]+$"), IgClass = "IgA")
-dimeric_IgA_data <- read_excel(here("data/COVID_profile/CP_AdjMFI_dimericIgA_Dec2023_FINAL.xlsx")) %>% mutate(code = str_extract(`Sample ID`, "[^-]+$"), IgClass = "dIgA")
+Import all relevant data.
+```{r, warning=FALSE}
+source(here("R_scripts/functions.R"))
+
+IgG_data <- read_excel(here("data/CP_AdjMFI_IgG_Dec2023_FINAL.xlsx")) %>% mutate(code = str_extract(SampleID, "[^-]+$"), IgClass = "IgG")
+IgM_data <- read_excel(here("data/CP_AdjMFI_IgM_Dec2023_FINAL.xlsx")) %>% mutate(code = str_extract(SampleID, "[^-]+$"), IgClass = "IgM")
+IgA_data <- read_excel(here("data/CP_AdjMFI_IgA_Dec2023_FINAL.xlsx")) %>% mutate(code = str_extract(SampleID, "[^-]+$"), IgClass = "IgA")
+dimeric_IgA_data <- read_excel(here("data/CP_AdjMFI_dimericIgA_Dec2023_FINAL.xlsx")) %>% mutate(code = str_extract(`Sample ID`, "[^-]+$"), IgClass = "dIgA")
 colnames(dimeric_IgA_data)[1] <- "SampleID"
 
-sample_dates <- read.csv(here("data/COVID_profile/blood_collection_dates.csv"))
+sample_dates <- read.csv(here("data/blood_collection_dates.csv"))
 sample_dates <- mutate_at(sample_dates, vars(3:9), list(ymd)) %>% filter(!if_all(c(3:9), is.na))
-clinical_data <- read.csv(here("data/COVID_profile/clinical_OCT2023.csv"))
+clinical_data <- read.csv(here("data/clinical_OCT2023.csv"))
 
 sample_dates_coded <- sample_dates %>% mutate(Event.Name = recode(Event.Name, "Baseline Visit (A)" = "A",
                                            "6 Week Visit (B)" = "B",
@@ -85,6 +84,8 @@ all_data <- full_join(rbind(IgG_data, IgM_data, IgA_data, dimeric_IgA_data), sam
 all_data <- all_data %>% group_by(Record.ID) %>% mutate(days = as.numeric(Date.of.blood.sample.collection - min(Date.of.blood.sample.collection, na.rm = T)), Record.ID = str_extract(SampleID, "([^.]+)(?=-)"))
 ```
 
+
+Filter data and remove individuals with less than two data points, any vaccination before enrollment, or no baseline sample.
 ```{r}
 all_data <- all_data %>%
   group_by(Record.ID) %>%
@@ -97,6 +98,8 @@ vaccine_info <- vaccine_info[vaccine_info$Record.ID %in% unique(all_data$Record.
 all_data <- all_data %>% left_join(vaccine_info, by = "Record.ID")
 ```
 
+
+Separate individuals according to "naive" and "recovered" status.
 ```{r}
 covid_naive <- all_data %>% filter(Record.ID %in% clinical_data$Record.ID[clinical_data$Please.indicate.appropriate.classification.based.on.answers....Baseline.Visit..A.. == "Non-COVID-19 healthy participant"]) %>% mutate(type = "naive")
 remove_ids <- covid_naive %>% group_by(Record.ID) %>% filter(all(is.na(Dose.1)) && !any(Event.Name == "Reinfection")) %>% ungroup()
@@ -106,139 +109,102 @@ covid_recovered <- all_data %>% filter(Record.ID %in% clinical_data$Record.ID[cl
 
 naive_ids <- unique(covid_naive$Record.ID)
 recovered_ids <- unique(covid_recovered$Record.ID)
+```
 
+
+Further separate according to which vaccine they received for their primary two doses.
+```{r}
 covid_naive_vaccines <- group_split(covid_naive %>% group_by(Which.vaccine...Baseline.Visit..A..))
 covid_recovered_vaccines <- group_split(covid_recovered %>% group_by(Which.vaccine...Baseline.Visit..A..))
 ```
 
 
-```{r}
-prep_stan_data <- function(individual, dat, protein, ig) {
-  df <- dat %>% filter(Record.ID == individual, IgClass %in% c(ig, NA)) %>% select(all_of(protein), Date.of.blood.sample.collection, When.did.you.receive.your.diagnosis.., Dose.1, Dose.2, Dose.3.., Dose.4, Dose.5, days, type)
-  df <- df %>% arrange(Date.of.blood.sample.collection)
-  
-  tau <- as.numeric(as.Date(c(df$Dose.1, df$Dose.2, df$Dose.3.., df$Dose.4, df$Dose.5, df$When.did.you.receive.your.diagnosis..)) - min(df$Date.of.blood.sample.collection, na.rm = T))
-  tau <- sort(tau[!is.na(tau) & tau >= 0])
-
-  dd <- as.numeric(as.Date(df$When.did.you.receive.your.diagnosis..) - min(df$Date.of.blood.sample.collection, na.rm = T))
-  dd <- abs(dd[!is.na(dd) & dd < 0])
-  
-  nat_inf <- as.numeric(as.Date(c(df$When.did.you.receive.your.diagnosis..)) - min(df$Date.of.blood.sample.collection, na.rm = T))
-  nat_inf <- sort(nat_inf[!is.na(nat_inf) & nat_inf > 0]) 
-
-  df <- df %>% drop_na(protein) %>% filter(!is.na(Date.of.blood.sample.collection))
-
-  if (unique(df$type) == "recovered") {
-    nat_inf <- c(0, nat_inf + dd)
-    time <- df$days + dd
-    tau <- c(0, tau + dd)
-    if (length(nat_inf) > 1) {
-      non_reinf_data <- which(time < nth(nat_inf,2))
-      new_tau <- tau[tau < nth(nat_inf,2)]
-    } else {
-      non_reinf_data <- 1:length(time)
-      new_tau <- tau
-    }
-  } else {
-    nat_inf <- nat_inf
-    time <- df$days 
-    tau <- tau
-    if (length(nat_inf) > 0) {
-      non_reinf_data <- which(time < min(nat_inf, na.rm = T) & time >= tau[1])
-      new_tau <- tau[tau < min(nat_inf, na.rm = T)]
-    } else {
-      new_tau <- tau
-      non_reinf_data <- which(time >= new_tau[1])
-    }
-  }
-  
-  new_time <- time[non_reinf_data]
-  antibodies <- df[[protein]]
-  new_ab <- antibodies[non_reinf_data]
-  
-  segments <- split(new_time, findInterval(new_time, new_tau))
-  ab_segments <- list()
-  time_segments <- list()
-  og_final_times <- list()
-  
-  for (i in 1:length(segments)) {
-    abs_i <- new_ab[which(new_time %in% unlist(segments[i]))]
-    times_i <- new_time[which(new_time %in% unlist(segments[i]))]
-    final_times_i <- times_i[which.max(abs_i):length(abs_i)]
-    final_abs_i <- abs_i[which.max(abs_i):length(abs_i)]
-    if (length(final_abs_i) > 1) {
-      og_final_times <- append(og_final_times, list(final_times_i))
-      final_times_i <- final_times_i - final_times_i[1]
-      ab_segments <- append(ab_segments, list(final_abs_i))
-      time_segments <- append(time_segments, list(final_times_i))
-    }
-  }
-
-  return(list(segments = segments, ab_segments = ab_segments, time_segments = time_segments, size_seg = length(ab_segments), size_all_seg = lengths(ab_segments), og_final_times = og_final_times, ID = individual))
-}
-
-covid_naive_mRNA <- rbind(covid_naive_vaccines[[2]], covid_naive_vaccines[[4]])
-covid_recovered_none <- covid_recovered_vaccines[[1]]
-covid_recovered_mRNA <- covid_recovered_vaccines[[4]]
-covid_recovered_nomRNA <- rbind(covid_recovered_vaccines[[2]], covid_recovered_vaccines[[3]])
-covid_naive_nomRNA <- rbind(covid_naive_vaccines[[1]], covid_naive_vaccines[[3]])
-
-inf_ids <- unique(covid_recovered_nomRNA$Record.ID)
-inf_df <- covid_recovered_nomRNA
-
-inf_results <- pbmclapply(inf_ids, prep_stan_data, inf_df, "Spike", "IgG", mc.cores = detectCores()/2)
-```
-
-```{r}
-# for vaccinations
-ab_segments <- unlist(lapply(inf_results, `[[`, 2))
-time_segments <- unlist(lapply(inf_results, `[[`, 3))
-no_segments <- unlist(lapply(inf_results, `[[`, 4))
-size_segments <- unlist(lapply(inf_results, `[[`, 5))
-og_times <- unlist(lapply(inf_results, `[[`, 6))
-
-complete_no_segments <- no_segments[no_segments != 0]
-
-
-stan_data <- list(N = length(ab_segments),
-                  K = length(complete_no_segments),
-                  J = length(size_segments),
-                  ab = ab_segments,
-                  times = time_segments,
-                  no_segments = complete_no_segments,
-                  size_segments = size_segments,
-                  og_times = og_times,
-                  og_segments = no_segments)
-
-
-# for infection only
-ab_segments <- unlist(lapply(lapply(inf_results, `[[`, 2), function(x) if (length(x) > 0) x[[1]] else NA))
-time_segments <- unlist(lapply(lapply(inf_results, `[[`, 3), function(x) if (length(x) > 0) x[[1]] else NA))
-size_segments <- unlist(lapply(lapply(inf_results, `[[`, 5), function(x) if (length(x) > 0) x[[1]] else NA))
-og_times <- unlist(lapply(lapply(inf_results, `[[`, 6), function(x) if (length(x) > 0) x[[1]] else NA))
-
-ab_segments <- na.omit(ab_segments)
-time_segments <- na.omit(time_segments)
-size_segments <- na.omit(size_segments)
-complete_no_segments <- rep(1, length(size_segments))
-og_times <- na.omit(og_times)
-
-stan_data <- list(N = length(ab_segments),
-                  K = length(complete_no_segments),
-                  J = length(size_segments),
-                  ab = ab_segments,
-                  times = time_segments,
-                  no_segments = complete_no_segments,
-                  size_segments = size_segments,
-                  og_times = og_times)
-
-```
-
+Run stan models for each comparison group.
 ```{r}
 control_params <- list(adapt_delta = 0.8, max_treedepth = 10)
-stan_fit <- stan(file = here("COVID/simple_exp_modelling.stan"), data = stan_data, iter =  10000, warmup = 1000, chains = 4, control = control_params)
+
+naive_mRNA <- rbind(covid_naive_vaccines[[2]], covid_naive_vaccines[[4]])
+recovered_mRNA <- covid_recovered_vaccines[[4]]
+recovered_nomRNA <- rbind(covid_recovered_vaccines[[2]], covid_recovered_vaccines[[3]])
+naive_nomRNA <- rbind(covid_naive_vaccines[[1]], covid_naive_vaccines[[3]])
+
+rec_threshold <- rbind(recovered_mRNA, recovered_nomRNA) %>% 
+                 filter(IgClass %in% c("IgG", NA)) %>% 
+                 filter(Event.Name %in% c("R1", "R2", "RR1", "RR2")) %>%
+                 summarise(threshold = mean(NP)) %>%
+                 pull(threshold)
+
+naive_threshold <- rbind(naive_mRNA, naive_nomRNA) %>% 
+                   filter(IgClass %in% c("IgG", NA)) %>% 
+                   filter(Event.Name %in% c("R1", "R2", "RR1", "RR2")) %>%
+                   summarise(threshold = mean(NP)) %>%
+                   pull(threshold)
+
+comparison_groups <- c("naive_mRNA", "recovered_mRNA", "recovered_nomRNA", "naive_nomRNA", "covid_recovered")
+antigens <- c("Spike", "RBD")
+
+for (group in comparison_groups) {
+  for (protein in antigens) {
+    inf_results <- pbmclapply(unique(get(group)$Record.ID), prep_stan_data_sp_model, get(group), protein, "IgG", mc.cores = detectCores()/2)
+    
+    if (group == "covid_recovered") {
+      ab_segments <- unlist(lapply(lapply(inf_results, `[[`, 2), function(x) if (length(x) > 0) x[[1]] else NA))
+      time_segments <- unlist(lapply(lapply(inf_results, `[[`, 3), function(x) if (length(x) > 0) x[[1]] else NA))
+      size_segments <- unlist(lapply(lapply(inf_results, `[[`, 5), function(x) if (length(x) > 0) x[[1]] else NA))
+      og_times <- unlist(lapply(lapply(inf_results, `[[`, 6), function(x) if (length(x) > 0) x[[1]] else NA))
+      
+      ids <- unique(get(group)$Record.ID)[!is.na(size_segments)]
+      ab_segments <- na.omit(ab_segments)
+      time_segments <- na.omit(time_segments)
+      size_segments <- na.omit(size_segments)
+      complete_no_segments <- rep(1, length(size_segments))
+      og_times <- na.omit(og_times)
+      
+      stan_data <- list(N = length(ab_segments),
+                        K = length(complete_no_segments),
+                        J = length(size_segments),
+                        ab = ab_segments,
+                        times = time_segments,
+                        no_segments = complete_no_segments,
+                        size_segments = size_segments,
+                        og_times = og_times,
+                        ids = ids)
+            
+      stan_fit <- stan(file = here("stan_scripts/COVID_monophasic_model.stan"), data = stan_data, iter =  10000, warmup = 1000, chains = 4, control = control_params)
+      
+    } else {
+      ab_segments <- unlist(lapply(inf_results, `[[`, 2))
+      time_segments <- unlist(lapply(inf_results, `[[`, 3))
+      no_segments <- unlist(lapply(inf_results, `[[`, 4))
+      size_segments <- unlist(lapply(inf_results, `[[`, 5))
+      og_times <- unlist(lapply(inf_results, `[[`, 6))
+      
+      complete_no_segments <- no_segments[no_segments != 0]
+      
+      
+      stan_data <- list(N = length(ab_segments),
+                        K = length(complete_no_segments),
+                        J = length(size_segments),
+                        ab = ab_segments,
+                        times = time_segments,
+                        no_segments = complete_no_segments,
+                        size_segments = size_segments,
+                        og_times = og_times,
+                        og_segments = no_segments,
+                        ids = unique(get(group)$Record.ID)[no_segments != 0])
+      
+      stan_fit <- stan(file = here("stan_scripts/COVID_monophasic_model.stan"), data = stan_data, iter =  10000, warmup = 1000, chains = 4, control = control_params)
+    }
+    assign(paste0("sp_IgG_", protein, "_", group), stan_fit)
+    save(list=paste0("sp_IgG_", protein, "_", group), file = here(paste0("results/model_fits/sp_IgG_", protein, "_", group, ".Rdata")))
+    assign(paste0("sp_IgG_", protein, "_", group, "_data"), stan_data)
+    save(list=paste0("sp_IgG_", protein, "_", group, "_data"), file = here(paste0("results/model_fits/sp_IgG_", protein, "_", group, "_data.Rdata")))
+  }
+}
 
 ```
+
+
 
 
 ```{r}
@@ -246,47 +212,59 @@ traceplot(stan_fit, pars = c("lambda_mu", "lambda_sd", "rate"))
 
 mcmc_pairs(stan_fit, pars = c("lambda_mu", "lambda_sd", "rate"), diag_fun = "dens", off_diag_fun = "hex")
 
-
 ```
 
+
+Plot SP model fits.
 ```{r}
-single_model_results <- rstan::extract(miceadds::load.Rdata2(filename = "IgG_RBD_naive_nomRNA.Rdata", path=here("COVID/results/simple_decay_fits/")))
-single_model_data <- miceadds::load.Rdata2(filename = "IgG_RBD_naive_nomRNA_data.Rdata", path=here("COVID/results/simple_decay_fits/"))
-pis <- predictive_interval(as.matrix(miceadds::load.Rdata2(filename = "IgG_RBD_naive_nomRNA.Rdata", path=here("COVID/results/simple_decay_fits/"))), prob = 0.95)
-indexes <- grepl("^y_rep[[0-9]+\\]$", row.names(pis))
-
-yrep_pis <- pis[indexes, ]
-yrep_pis <- cbind(yrep_pis, means = colMeans(single_model_results$y_rep))
-
-plot_ids <- unique(covid_naive_nomRNA$Record.ID)[which(single_model_data$og_segments != 0)]
-
-id_size <- c()
-pos <- 1
-for (i in 1:length(single_model_data$no_segments)) {
-  size <- 0
-  for (j in 1:single_model_data$no_segments[i]) {
-    size <- size + single_model_data$size_segments[pos]
-    pos <- pos + 1
+sp_model_fits <- function(stan_file, stan_data) {
+  stan_results <- get(stan_file)
+  pis <- predictive_interval(stan_results$y_rep, prob = 0.95)
+  yrep_pis <- cbind(pis, medians = colMedians(stan_results$y_rep))
+  
+  sp_id_size <- c()
+  pos <- 1
+  for (i in 1:length(stan_data$no_segments)) {
+    size <- 0
+    for (j in 1:stan_data$no_segments[i]) {
+      size <- size + stan_data$size_segments[pos]
+      pos <- pos + 1
+    }
+    sp_id_size <- c(sp_id_size, size)
   }
-  id_size <- c(id_size, size)
+  sp_ids <- rep(stan_data$ids, sp_id_size)
+  
+  single_plot_data <- as.data.frame(yrep_pis) %>% mutate(days = stan_data$og_times, ID = sp_ids)
+  single_plot_data <- as.data.frame(lapply(single_plot_data, unlist))  %>% group_by(ID) %>% mutate(group = cumsum(lag(medians, default = first(medians)) < medians) + 1) 
+
+  stan_input <- tibble(y = bp_stan_data$y, time = bp_stan_data$time, ID = rep(bp_stan_data$ids, bp_stan_data$size_y))
+  
+  ggplot() + 
+    geom_ribbon(data = single_plot_data, 
+                aes(x = days, 
+                    ymin = X2.5., 
+                    ymax = X97.5., 
+                    colour = "95% posterior\npredictive interval",
+                    group = group), 
+                alpha = 0.5) + 
+    geom_point(data = stan_input, 
+               aes(x = time, y = y, colour = "Observed data")) + 
+    geom_line(data = single_plot_data, aes(x = days, y = medians, colour = "Posterior predictive\nmedian", group = group)) + 
+  facet_wrap(ID ~ ., scales = "free_x", ncol = 4) + 
+    ylab("Adjusted MFI") + 
+    xlab("Time since first exposure (days)") + 
+    scale_colour_manual(values = c("darkgrey", "black", "black")) + 
+    theme_bw() + 
+    theme(axis.text=element_text(size=25), axis.title=element_text(size=25), strip.text = element_text(size = 25), legend.text=element_text(size=25), plot.title = element_text(size=27), legend.title=element_blank(), panel.grid.major = element_blank(), panel.grid.minor = element_blank())
+  
+  ggsave(here(paste0("results/paper_plots_revised/", stan_file, "_model_fits.png")), height = 40, width = 20, dpi = 300)
+  ggsave(here(paste0("results/paper_plots_revised/", stan_file, "_model_fits.pdf")), height = 40, width = 20, dpi = 300)
 }
 
-ids <- rep(plot_ids, id_size)
+sp_model_fits("sp_rec_none_rbd", sp_IgG_RBD_covid_recovered_data)
+  
 
-plot_data <- as.data.frame(yrep_pis) %>% mutate(days = single_model_data$og_times, ID = ids)
-plot_data <- as.data.frame(lapply(plot_data, unlist)) %>% group_by(ID) %>% mutate(group = cumsum(lag(means, default = first(means)) < means) + 1)
-stan_input <- tibble(y = single_model_data$ab, time = single_model_data$og_times, ID = ids)
-
-
-ggplot() + geom_ribbon(data = plot_data, aes(x = days, ymin = X2.5., ymax = X97.5., colour = "95% posterior\npredictive interval", group = group), alpha = 0.5) + geom_point(data = stan_input, aes(x = time, y = y, colour = "Observed data")) + geom_line(data = plot_data, aes(x = days, y = means, colour = "Posterior predictive\nmean", group = group)) + 
-  facet_wrap(ID ~ ., scales = "fixed", ncol = 4) + ylab("Adjusted MFI") + xlab("Time since first exposure") + scale_colour_manual(values = c("darkgrey", "black", "black")) + theme(axis.text=element_text(size=20), axis.title=element_text(size=20), strip.text = element_text(size = 20), legend.text=element_text(size=20), plot.title = element_text(size=22), legend.title=element_blank())
-
-
-ggsave(here("COVID/results/paper_plots/IgG_RBD_naive_nomRNA_model_fits.png"), height = 17, width = 20, dpi = 300)
 ```
-
-
-
 
 
 
